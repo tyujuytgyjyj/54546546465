@@ -382,6 +382,16 @@ Ogre::HlmsBlendblock skyBlend;
 skyUnlit->createDatablock("ApexSkyGradient", "ApexSkyGradient", skyMacro, skyBlend, Ogre::HlmsParamVec());
 ctx->skyManual = ctx->sceneMgr->createManualObject(Ogre::SCENE_DYNAMIC);
 ctx->skyManual->setRenderQueueGroup(kSkyRenderQueueGroup);
+
+// Dedicated opaque water surface. Vertex colours carry Fresnel/sky reflection
+// and sun glints; no generic PBS transparency can bleach the terrain below.
+Ogre::HlmsMacroblock waterMacro;
+waterMacro.mDepthCheck = true;
+waterMacro.mDepthWrite = true;
+waterMacro.mCullMode = Ogre::CULL_NONE;
+Ogre::HlmsBlendblock waterBlend;
+skyUnlit->createDatablock(
+    "ApexWaterSurface", "ApexWaterSurface", waterMacro, waterBlend, Ogre::HlmsParamVec());
 ctx->skyManual->setCastShadows(false);
 ctx->skyManual->setLocalAabb(Ogre::Aabb::BOX_INFINITE);
 ctx->skyNode = ctx->camNode->createChildSceneNode(Ogre::SCENE_DYNAMIC);
@@ -578,6 +588,12 @@ return dbName;
 // ---------------------------------------------------------------------------
 // Drawing 3D (TRS: موضع + دوران كواتيرنيون + مقياس)
 // ---------------------------------------------------------------------------
+static Ogre::Vector3 skyColourForRay(const Ogre::Vector3& rayWorld,
+                                     const Ogre::Vector3& sunDirWorld,
+                                     float sunElevation,
+                                     const Ogre::Vector3& observerWorld,
+                                     float timeSeconds);
+
 BRIDGE_API void ogre_draw_mesh_trs(
 void* raw_ctx, uint32_t mesh_id,
 float px, float py, float pz,
@@ -595,9 +611,13 @@ if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pz) ||
     !std::isfinite(sx) || !std::isfinite(sy) || !std::isfinite(sz) ||
     std::fabs(sx) < 1.0e-6f || std::fabs(sy) < 1.0e-6f || std::fabs(sz) < 1.0e-6f) return;
 CachedMesh& cm = it->second;
-std::string dbName = getOrCreatePbsDatablockName(
-ctx, cm.tex_id, tint_r, tint_g, tint_b,
-cm.avg_spec, is_glass || cm.is_glass, cm.is_water, cm.base_a);
+// Water has its own reflective vertex-colour pass; it must not use the generic
+// PBS alpha material that was washing out the ground under incorrect water cells.
+std::string dbName = cm.is_water
+    ? std::string("ApexWaterSurface")
+    : getOrCreatePbsDatablockName(
+        ctx, cm.tex_id, tint_r, tint_g, tint_b,
+        cm.avg_spec, is_glass || cm.is_glass, false, cm.base_a);
 size_t idx = cm.used_this_frame++;
 if (idx >= cm.pool_objs.size()) {
 Ogre::ManualObject* newObj = ctx->sceneMgr->createManualObject(Ogre::SCENE_DYNAMIC);
@@ -621,9 +641,13 @@ mo->setRenderQueueGroup(is_transparent ? kTransparentRenderQueueGroup : kWorldRe
 mo->setCastShadows(!is_transparent);
 mo->setVisible(true);
 if (cm.is_water) {
-    // Low-amplitude multi-directional waves; normals are derived analytically
-    // so water highlights move instead of remaining a flat plastic sheet.
+    // Multi-scale travelling waves with analytic normals and per-frame sky
+    // reflection. Clouds, sunset and the sun glints are shared with the sky pass.
     const float waveTime = static_cast<float>(GetTickCount64()) * 0.001f;
+    const Ogre::Quaternion waterOrientation(qw, qx, qy, qz);
+    const Ogre::Vector3 waterPosition(px, py, pz);
+    const Ogre::Vector3 cameraPosition = ctx->camNode->getPosition();
+    const Ogre::Vector3 sunDirection = ctx->skySunDir.normalisedCopy();
     auto& waveVerts = cm.animated_verts;
     if (waveVerts.size() != cm.cpu_verts.size()) waveVerts.resize(cm.cpu_verts.size());
     for (size_t vi = 0; vi < cm.cpu_verts.size(); ++vi) {
@@ -632,17 +656,65 @@ if (cm.is_water) {
         dst = src;
         const float x = src.px;
         const float z = src.pz;
-        const float a = x * 0.17f + z * 0.11f + waveTime * 0.82f;
-        const float b = x * -0.13f + z * 0.21f - waveTime * 1.07f;
-        const float d = x * 0.31f - z * 0.27f + waveTime * 1.43f;
+        const float a = x * 0.19f + z * 0.13f + waveTime * 0.74f;
+        const float b = x * -0.11f + z * 0.23f - waveTime * 0.96f;
+        const float d = x * 0.34f - z * 0.29f + waveTime * 1.31f;
         const float ca = std::cos(a), cb = std::cos(b), cd = std::cos(d);
-        dst.py += 0.026f * std::sin(a) + 0.014f * std::sin(b) + 0.006f * std::sin(d);
-        Ogre::Vector3 n(
-            -(0.026f * 0.17f * ca - 0.014f * 0.13f * cb + 0.006f * 0.31f * cd),
+        dst.py += 0.052f * std::sin(a) + 0.022f * std::sin(b) + 0.010f * std::sin(d);
+        Ogre::Vector3 localNormal(
+            -(0.052f * 0.19f * ca - 0.022f * 0.11f * cb + 0.010f * 0.34f * cd),
             1.0f,
-            -(0.026f * 0.11f * ca + 0.014f * 0.21f * cb - 0.006f * 0.27f * cd));
-        n.normalise();
-        dst.nx = n.x; dst.ny = n.y; dst.nz = n.z;
+            -(0.052f * 0.13f * ca + 0.022f * 0.23f * cb - 0.010f * 0.29f * cd));
+        localNormal.normalise();
+        dst.nx = localNormal.x; dst.ny = localNormal.y; dst.nz = localNormal.z;
+
+        const Ogre::Vector3 localPosition(x * sx, dst.py * sy, z * sz);
+        const Ogre::Vector3 worldPosition = waterPosition + waterOrientation * localPosition;
+        Ogre::Vector3 worldNormal(localNormal.x / sx, localNormal.y / sy, localNormal.z / sz);
+        worldNormal = (waterOrientation * worldNormal).normalisedCopy();
+        Ogre::Vector3 viewDirection = cameraPosition - worldPosition;
+        if (viewDirection.squaredLength() < 1.0e-6f) viewDirection = Ogre::Vector3::UNIT_Y;
+        else viewDirection.normalise();
+
+        const float ndv = skyClamp01(worldNormal.dotProduct(viewDirection));
+        Ogre::Vector3 reflected = -viewDirection + worldNormal * (2.0f * ndv);
+        if (reflected.y < 0.0f) reflected.y = -reflected.y;
+        if (reflected.squaredLength() < 1.0e-6f) reflected = Ogre::Vector3::UNIT_Y;
+        else reflected.normalise();
+
+        const Ogre::Vector3 reflectedSky = skyColourForRay(
+            reflected, sunDirection, ctx->skySunElevation, worldPosition, waveTime);
+        const Ogre::Vector3 sourceColour(src.r / 255.0f, src.g / 255.0f, src.b / 255.0f);
+        const Ogre::Vector3 deepWater(
+            0.006f + sourceColour.x * 0.035f,
+            0.034f + sourceColour.y * 0.075f,
+            0.050f + sourceColour.z * 0.095f);
+        const float fresnel = 0.02f + 0.98f * std::pow(1.0f - ndv, 5.0f);
+        const float reflectionWeight = 0.20f + 0.74f * fresnel;
+        Ogre::Vector3 waterColour =
+            deepWater * (1.0f - reflectionWeight) +
+            reflectedSky * (reflectionWeight * 0.88f);
+
+        Ogre::Vector3 halfVector = viewDirection + sunDirection;
+        if (halfVector.squaredLength() < 1.0e-6f) halfVector = Ogre::Vector3::UNIT_Y;
+        else halfVector.normalise();
+        const float sunGlint =
+            std::pow(std::fmax(worldNormal.dotProduct(halfVector), 0.0f), 190.0f) *
+            skySmoothstep(-0.10f, 0.22f, ctx->skySunElevation);
+        const float solarDisc =
+            std::pow(std::fmax(reflected.dotProduct(sunDirection), 0.0f), 210.0f) *
+            skySmoothstep(-0.06f, 0.12f, ctx->skySunElevation);
+        const float ripple = 0.5f + 0.5f * std::sin(
+            x * 0.73f + z * 0.41f + waveTime * 1.7f);
+        waterColour += Ogre::Vector3(1.0f, 0.78f, 0.53f) *
+                       (sunGlint * 1.15f + solarDisc * 0.72f);
+        waterColour += Ogre::Vector3(0.010f, 0.024f, 0.030f) *
+                       (ripple * (0.15f + fresnel * 0.35f));
+
+        dst.r = static_cast<uint8_t>(skyClamp01(waterColour.x) * 255.0f);
+        dst.g = static_cast<uint8_t>(skyClamp01(waterColour.y) * 255.0f);
+        dst.b = static_cast<uint8_t>(skyClamp01(waterColour.z) * 255.0f);
+        dst.a = 255; // opaque: do not alpha-wash roads or terrain underneath.
     }
     populateManualObject(mo, dbName, waveVerts, cm.cpu_indices);
 }
@@ -761,23 +833,59 @@ static float skySmoothstep(float a, float b, float x) {
 static Ogre::Vector3 skyMix(const Ogre::Vector3& a, const Ogre::Vector3& b, float t) {
     return a * (1.0f - t) + b * t;
 }
-static Ogre::Vector3 skyColourForRay(const Ogre::Vector3& ray,
-                                     const Ogre::Vector3& sunDirLocal,
-                                     float sunElevation) {
+static float skyHash2(float x, float y) {
+    const float h = std::sin(x * 127.1f + y * 311.7f) * 43758.5453f;
+    return h - std::floor(h);
+}
+static float skyNoise2(float x, float y) {
+    const float ix = std::floor(x), iy = std::floor(y);
+    const float fx0 = x - ix, fy0 = y - iy;
+    const float fx = fx0 * fx0 * (3.0f - 2.0f * fx0);
+    const float fy = fy0 * fy0 * (3.0f - 2.0f * fy0);
+    const float a = skyHash2(ix, iy);
+    const float b = skyHash2(ix + 1.0f, iy);
+    const float c = skyHash2(ix, iy + 1.0f);
+    const float d = skyHash2(ix + 1.0f, iy + 1.0f);
+    return (a * (1.0f - fx) + b * fx) * (1.0f - fy) +
+           (c * (1.0f - fx) + d * fx) * fy;
+}
+static float skyFbm2(float x, float y) {
+    float amplitude = 0.52f;
+    float sum = 0.0f;
+    float norm = 0.0f;
+    for (int octave = 0; octave < 5; ++octave) {
+        sum += skyNoise2(x, y) * amplitude;
+        norm += amplitude;
+        x = x * 2.03f + 17.13f;
+        y = y * 2.03f + 9.17f;
+        amplitude *= 0.5f;
+    }
+    return sum / std::fmax(norm, 1.0e-4f);
+}
+
+// Direction is world-space so both the camera sky and water can sample the
+// same animated cloud layers, sun halo and atmospheric scattering.
+static Ogre::Vector3 skyColourForRay(const Ogre::Vector3& rayWorld,
+                                     const Ogre::Vector3& sunDirWorld,
+                                     float sunElevation,
+                                     const Ogre::Vector3& observerWorld,
+                                     float timeSeconds) {
+    const Ogre::Vector3 ray = rayWorld.normalisedCopy();
+    const Ogre::Vector3 sun = sunDirWorld.normalisedCopy();
     const float day = skySmoothstep(-0.10f, 0.25f, sunElevation);
     const float twilight = skySmoothstep(-0.24f, 0.015f, sunElevation) *
                            (1.0f - skySmoothstep(0.06f, 0.34f, sunElevation));
     const float night = 1.0f - skySmoothstep(-0.16f, 0.035f, sunElevation);
 
-    const Ogre::Vector3 zenNight(0.006f, 0.012f, 0.032f);
-    const Ogre::Vector3 zenDay(0.025f, 0.12f, 0.39f);
-    const Ogre::Vector3 zenTwilight(0.025f, 0.040f, 0.135f);
-    const Ogre::Vector3 horNight(0.012f, 0.021f, 0.052f);
-    const Ogre::Vector3 horDay(0.48f, 0.66f, 0.86f);
-    const Ogre::Vector3 horSun(1.00f, 0.27f, 0.075f);
-    const Ogre::Vector3 horAnti(0.20f, 0.12f, 0.28f);
+    const Ogre::Vector3 zenNight(0.004f, 0.008f, 0.024f);
+    const Ogre::Vector3 zenDay(0.018f, 0.105f, 0.34f);
+    const Ogre::Vector3 zenTwilight(0.020f, 0.032f, 0.115f);
+    const Ogre::Vector3 horNight(0.010f, 0.018f, 0.044f);
+    const Ogre::Vector3 horDay(0.50f, 0.69f, 0.88f);
+    const Ogre::Vector3 horSun(1.15f, 0.34f, 0.105f);
+    const Ogre::Vector3 horAnti(0.24f, 0.13f, 0.30f);
 
-    Ogre::Vector3 sunFlat(sunDirLocal.x, 0.0f, sunDirLocal.z);
+    Ogre::Vector3 sunFlat(sun.x, 0.0f, sun.z);
     if (sunFlat.squaredLength() < 1.0e-4f) sunFlat = Ogre::Vector3::UNIT_Z;
     sunFlat.normalise();
     Ogre::Vector3 rayFlat(ray.x, 0.0f, ray.z);
@@ -788,22 +896,102 @@ static Ogre::Vector3 skyColourForRay(const Ogre::Vector3& ray,
     Ogre::Vector3 zen = skyMix(zenNight, zenDay, day);
     zen = skyMix(zen, zenTwilight, twilight * 0.92f);
     Ogre::Vector3 horizon = skyMix(horNight, horDay, day);
-    const Ogre::Vector3 warmHorizon = skyMix(horAnti, horSun, std::pow(azimuth, 1.45f));
-    horizon = skyMix(horizon, warmHorizon, twilight);
+    horizon = skyMix(horizon,
+        skyMix(horAnti, horSun, std::pow(azimuth, 1.42f)), twilight);
 
     const float y = skyClamp01(ray.y);
-    const float vertical = std::pow(y, 0.52f);
+    const float vertical = std::pow(y, 0.50f);
     Ogre::Vector3 colour = skyMix(horizon, zen, vertical);
+    const float haze = std::exp(-y * 10.0f) * std::pow(azimuth, 2.0f) * twilight;
+    colour += Ogre::Vector3(0.22f, 0.075f, 0.020f) * haze;
 
-    // A broad low-altitude glow toward the sun gives sunsets depth without
-    // flattening the whole horizon into one orange strip.
-    const float haze = std::exp(-y * 11.0f) * std::pow(azimuth, 2.0f) * twilight;
-    colour += Ogre::Vector3(0.22f, 0.075f, 0.018f) * haze;
+    const float sunDot = std::fmax(ray.dotProduct(sun), 0.0f);
+    const float sunVisible = skySmoothstep(-0.10f, 0.035f, sunElevation);
+    const Ogre::Vector3 sunTint = skyMix(
+        Ogre::Vector3(1.75f, 0.43f, 0.10f),
+        Ogre::Vector3(1.15f, 0.93f, 0.73f),
+        skySmoothstep(0.0f, 0.32f, sunElevation));
+    const float disc = std::pow(sunDot, 420.0f) * sunVisible;
+    const float halo = std::pow(sunDot, 18.0f) * (0.12f + 0.34f * twilight) * sunVisible;
+    const float broadScatter = std::pow(sunDot, 3.0f) * (0.018f + 0.055f * twilight) * sunVisible;
+    colour += sunTint * (disc * 2.0f + halo + broadScatter);
 
-    const float sunDot = std::fmax(ray.dotProduct(sunDirLocal.normalisedCopy()), 0.0f);
-    const float disc = std::pow(sunDot, 180.0f) * skySmoothstep(-0.025f, 0.04f, sunElevation);
-    const float halo = std::pow(sunDot, 12.0f) * twilight * 0.12f;
-    colour += Ogre::Vector3(1.0f, 0.72f, 0.40f) * (disc * 1.6f + halo);
+    // Stable star field on the celestial sphere, naturally hidden by clouds.
+    if (night > 0.02f && ray.y > 0.025f) {
+        const float starU = std::atan2(ray.z, ray.x) * 205.0f;
+        const float starV = std::asin(skyClamp01(ray.y)) * 165.0f;
+        const float starHash = skyHash2(std::floor(starU), std::floor(starV));
+        const float star = skySmoothstep(0.9935f, 0.9997f, starHash) *
+                           (0.65f + 0.35f * std::sin(timeSeconds * 1.7f + starHash * 91.0f));
+        colour += Ogre::Vector3(0.60f, 0.72f, 1.0f) * star * night * 0.9f;
+    }
+
+    float cumulusDensity = 0.0f;
+    float cirrusDensity = 0.0f;
+    float cumulusShade = 0.50f;
+    if (ray.y > -0.005f) {
+        const float projectedY = std::fmax(ray.y, 0.035f);
+        const float lowDistance = std::fmax((1050.0f - observerWorld.y) / projectedY, 0.0f);
+        const float cloudX = observerWorld.x + ray.x * lowDistance + timeSeconds * 7.5f;
+        const float cloudZ = observerWorld.z + ray.z * lowDistance - timeSeconds * 3.2f;
+        const float px = cloudX * 0.00115f;
+        const float pz = cloudZ * 0.00115f;
+        const float broad = skyFbm2(px, pz);
+        const float medium = skyFbm2(px * 2.7f + 11.2f, pz * 2.7f - 6.4f);
+        const float erosion = skyFbm2(px * 7.1f - 3.7f, pz * 7.1f + 8.1f);
+        const float billows = broad * 0.66f + medium * 0.25f + erosion * 0.09f;
+        const float shaped = billows + (erosion - 0.5f) * 0.055f;
+        cumulusDensity = skySmoothstep(0.555f, 0.685f, shaped);
+        cumulusShade = skyClamp01(0.34f + medium * 0.42f + erosion * 0.16f + sunVisible * 0.10f);
+
+        // A separate stretched high layer creates wispy cirrus streaks.
+        const float highDistance = std::fmax((2650.0f - observerWorld.y) / projectedY, 0.0f);
+        const float highX = (observerWorld.x + ray.x * highDistance) * 0.00042f + timeSeconds * 0.0018f;
+        const float highZ = (observerWorld.z + ray.z * highDistance) * 0.00165f - timeSeconds * 0.0042f;
+        const float cirrusNoise = skyFbm2(highX, highZ);
+        cirrusDensity = skySmoothstep(0.605f, 0.755f, cirrusNoise) *
+                        (0.18f + 0.20f * day + 0.10f * twilight + 0.08f * night);
+    }
+
+    if (cumulusDensity > 0.002f || cirrusDensity > 0.002f) {
+        const Ogre::Vector3 topDay(1.18f, 1.20f, 1.18f);
+        const Ogre::Vector3 bottomDay(0.40f, 0.49f, 0.62f);
+        const Ogre::Vector3 topTwilight(1.48f, 0.66f, 0.31f);
+        const Ogre::Vector3 bottomTwilight(0.17f, 0.105f, 0.20f);
+        const Ogre::Vector3 topNight(0.075f, 0.095f, 0.15f);
+        const Ogre::Vector3 bottomNight(0.012f, 0.018f, 0.038f);
+
+        Ogre::Vector3 cloudTop = skyMix(topNight, topDay, day);
+        cloudTop = skyMix(cloudTop, topTwilight, twilight);
+        Ogre::Vector3 cloudBottom = skyMix(bottomNight, bottomDay, day);
+        cloudBottom = skyMix(cloudBottom, bottomTwilight, twilight);
+        const float cloudLight = skyClamp01(cumulusShade + sunVisible * 0.10f);
+        Ogre::Vector3 cloudColour = skyMix(cloudBottom, cloudTop, cloudLight);
+        const float silverLining = std::pow(sunDot, 5.0f) *
+                                   (0.22f + 0.75f * twilight) * sunVisible;
+        cloudColour += sunTint * silverLining * 0.42f;
+
+        const float horizonFade = 0.78f + 0.22f * skySmoothstep(-0.02f, 0.16f, ray.y);
+        const float totalCloud = 1.0f - (1.0f - cumulusDensity * 0.96f) *
+                                       (1.0f - cirrusDensity);
+        colour = skyMix(colour, cloudColour,
+                        skyClamp01(totalCloud * horizonFade));
+    }
+
+    if (night > 0.02f) {
+        Ogre::Vector3 moonDir(-sun.x, std::fmax(-sun.y, 0.16f), -sun.z);
+        if (moonDir.squaredLength() > 1.0e-4f) moonDir.normalise();
+        const float moonDot = std::fmax(ray.dotProduct(moonDir), 0.0f);
+        colour += Ogre::Vector3(0.12f, 0.18f, 0.32f) *
+                  std::pow(moonDot, 22.0f) * night * 0.55f;
+    }
+
+    if (ray.y < 0.0f) {
+        const Ogre::Vector3 groundNight(0.008f, 0.012f, 0.024f);
+        const Ogre::Vector3 groundDay(0.20f, 0.24f, 0.20f);
+        colour = skyMix(horizon, skyMix(groundNight, groundDay, day),
+                        skyClamp01(-ray.y * 6.0f));
+    }
     return Ogre::Vector3(skyClamp01(colour.x), skyClamp01(colour.y), skyClamp01(colour.z));
 }
 static void updateSkyGradient(OgreContext* ctx, float sw, float sh) {
@@ -813,10 +1001,13 @@ static void updateSkyGradient(OgreContext* ctx, float sw, float sh) {
     const float tanHalf = std::tan(ctx->camera->getFOVy().valueRadians() * 0.5f);
     const float halfH = d * tanHalf * 1.08f;
     const float halfW = halfH * aspect;
-    const Ogre::Vector3 sunLocal = ctx->camNode->getOrientation().Inverse() * ctx->skySunDir;
+    const Ogre::Vector3 sunWorld = ctx->skySunDir.normalisedCopy();
+    const Ogre::Vector3 cameraWorld = ctx->camNode->getPosition();
+    const Ogre::Quaternion cameraOrientation = ctx->camNode->getOrientation();
+    const float timeSeconds = static_cast<float>(GetTickCount64()) * 0.001f;
 
-    constexpr int cols = 32;
-    constexpr int rows = 12;
+    constexpr int cols = 160;
+    constexpr int rows = 90;
     ctx->skyManual->clear();
     ctx->skyManual->setRenderQueueGroup(kSkyRenderQueueGroup);
     ctx->skyManual->setLocalAabb(Ogre::Aabb::BOX_INFINITE);
@@ -825,9 +1016,11 @@ static void updateSkyGradient(OgreContext* ctx, float sw, float sh) {
         const float ny = 1.08f - 2.16f * static_cast<float>(y) / static_cast<float>(rows);
         for (int x = 0; x <= cols; ++x) {
             const float nx = -1.08f + 2.16f * static_cast<float>(x) / static_cast<float>(cols);
-            Ogre::Vector3 ray(nx * aspect * tanHalf, ny * tanHalf, -1.0f);
-            ray.normalise();
-            const Ogre::Vector3 colour = skyColourForRay(ray, sunLocal, ctx->skySunElevation);
+            Ogre::Vector3 rayLocal(nx * aspect * tanHalf, ny * tanHalf, -1.0f);
+            rayLocal.normalise();
+            const Ogre::Vector3 rayWorld = (cameraOrientation * rayLocal).normalisedCopy();
+            const Ogre::Vector3 colour = skyColourForRay(
+                rayWorld, sunWorld, ctx->skySunElevation, cameraWorld, timeSeconds);
             ctx->skyManual->position(nx * halfW, ny * halfH, -d);
             ctx->skyManual->colour(colour.x, colour.y, colour.z, 1.0f);
         }
