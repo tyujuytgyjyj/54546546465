@@ -174,8 +174,12 @@ static void createApexAtmosphereSky(OgreContext* ctx) {
     Ogre::HlmsMacroblock macro;
     macro.mDepthCheck=true; macro.mDepthWrite=false; macro.mCullMode=Ogre::CULL_NONE;
     Ogre::HlmsBlendblock blend;
-    if(!unlit->getDatablock(ctx->skyDbName))
-        unlit->createDatablock(ctx->skyDbName,ctx->skyDbName,macro,blend,Ogre::HlmsParamVec());
+    Ogre::HlmsUnlitDatablock* skyDb = static_cast<Ogre::HlmsUnlitDatablock*>(
+        unlit->getDatablock(ctx->skyDbName));
+    if(!skyDb)
+        skyDb = static_cast<Ogre::HlmsUnlitDatablock*>(
+            unlit->createDatablock(ctx->skyDbName,ctx->skyDbName,macro,blend,Ogre::HlmsParamVec()));
+    skyDb->setUseColour(true);
     ctx->skyManual=ctx->sceneMgr->createManualObject(Ogre::SCENE_DYNAMIC);
     ctx->skyManual->setRenderQueueGroup(0);
     ctx->skyManual->setCastShadows(false);
