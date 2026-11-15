@@ -33,6 +33,8 @@
 #include "Compositor/OgreCompositorManager2.h"
 #include "Compositor/OgreCompositorWorkspace.h"
 #include "Compositor/OgreCompositorShadowNode.h"
+#include "Compositor/OgreCompositorNodeDef.h"
+#include "Compositor/Pass/PassScene/OgreCompositorPassSceneDef.h"
 #include "OgreHlmsManager.h"
 #include "OgreHlmsPbs.h"
 #include "OgreHlmsPbsDatablock.h"
@@ -304,6 +306,37 @@ static void createApexAtmosphereSky(OgreContext* ctx) {
     ctx->skyNode->attachObject(ctx->skyManual);
     rebuildApexSky(ctx,0.55f,Ogre::ColourValue(0.48f,0.68f,0.94f,1.0f));
 }
+
+static void appendApexUiPassToHdrWorkspace(Ogre::CompositorManager2* compMgr) {
+    if (!compMgr) return;
+    Ogre::CompositorNodeDef* uiNode =
+        compMgr->getNodeDefinitionNonConst(Ogre::IdString("HdrRenderUi"));
+    if (!uiNode || uiNode->getNumTargetPasses() == 0u) return;
+
+    // Stock HDR UI pass draws legacy overlays (RQ 254..255). The game's
+    // alpha-blended ManualObject is in RQ 1; draw it after tone mapping.
+    Ogre::CompositorTargetDef* target = uiNode->getTargetPass(0u);
+    const Ogre::CompositorPassDefVec& existing = target->getCompositorPasses();
+    for (const Ogre::CompositorPassDef* pass : existing) {
+        if (pass->getType() != Ogre::PASS_SCENE) continue;
+        const Ogre::CompositorPassSceneDef* scene =
+            static_cast<const Ogre::CompositorPassSceneDef*>(pass);
+        if (scene->mFirstRQ == 1u && scene->mLastRQ == 2u) return;
+    }
+
+    Ogre::CompositorPassSceneDef* uiPass =
+        static_cast<Ogre::CompositorPassSceneDef*>(target->addPass(Ogre::PASS_SCENE));
+    uiPass->mFirstRQ = 1u;
+    uiPass->mLastRQ = 2u;
+    uiPass->mIncludeOverlays = false;
+    uiPass->mUpdateLodLists = false;
+    uiPass->setAllLoadActions(Ogre::LoadAction::DontCare);
+    uiPass->mLoadActionColour[0] = Ogre::LoadAction::Load;
+    uiPass->setAllStoreActions(Ogre::StoreAction::Store);
+    uiPass->mStoreActionDepth = Ogre::StoreAction::DontCare;
+    uiPass->mStoreActionStencil = Ogre::StoreAction::DontCare;
+}
+
 static void createApexPssmShadowNode(OgreContext* ctx,Ogre::CompositorManager2* compMgr) {
     const Ogre::String nodeName="ApexForzaPssmShadowNode";
     if(!ctx || !compMgr || compMgr->hasShadowNodeDefinition(nodeName)) return;
@@ -399,6 +432,11 @@ static void registerHlms(Ogre::Root* root) {
     auto& rgm = Ogre::ResourceGroupManager::getSingleton();
     rgm.addResourceLocation(mediaRoot + "2.0/scripts/materials/Common",      "FileSystem", "General");
     rgm.addResourceLocation(mediaRoot + "2.0/scripts/materials/Common/HLSL", "FileSystem", "General");
+    // Ogre 3.0 native HDR, bloom, tone mapping and D3D11 shader sources.
+    rgm.addResourceLocation(mediaRoot + "2.0/scripts/materials/HDR", "FileSystem", "General");
+    rgm.addResourceLocation(mediaRoot + "2.0/scripts/materials/HDR/HLSL", "FileSystem", "General");
+    // Supplies the PSSM node referenced by the stock HDR compositor workspace.
+    rgm.addResourceLocation(mediaRoot + "2.0/scripts/Compositors", "FileSystem", "General");
     rgm.initialiseAllResourceGroups(true);
 }
 
@@ -583,19 +621,29 @@ ctx->uiNode = ctx->camNode->createChildSceneNode(Ogre::SCENE_DYNAMIC);
 ctx->uiNode->attachObject(ctx->uiManual);
 // --- Workspace أساسي ---
 Ogre::CompositorManager2* compMgr = ctx->root->getCompositorManager2();
-const Ogre::String wsName = "ApexBasicWS";
+const Ogre::String fallbackWorkspaceName = "ApexBasicWS";
 createApexAtmosphereSky(ctx);
 createApexEnvironmentCubemap(ctx);
 createApexPssmShadowNode(ctx, compMgr);
 Ogre::HlmsPbs* pbsForShadows = static_cast<Ogre::HlmsPbs*>(
     ctx->root->getHlmsManager()->getHlms(Ogre::HLMS_PBS));
 if (pbsForShadows) pbsForShadows->setShadowSettings(Ogre::HlmsPbs::PCF_3x3);
-if (!compMgr->hasWorkspaceDefinition(wsName)) {
-compMgr->createBasicWorkspaceDef(
-wsName, Ogre::ColourValue(0.48f, 0.68f, 0.94f, 1.0f),
-Ogre::IdString("ApexForzaPssmShadowNode"));
+
+const bool windowHasMsaa = ctx->window->getSampleDescription().isMultisample();
+const Ogre::String hdrWorkspaceName = windowHasMsaa ? "HdrWorkspaceMsaa" : "HdrWorkspace";
+const bool hdrWorkspaceAvailable = compMgr->hasWorkspaceDefinition(hdrWorkspaceName);
+if (hdrWorkspaceAvailable) {
+    appendApexUiPassToHdrWorkspace(compMgr);
+} else if (!compMgr->hasWorkspaceDefinition(fallbackWorkspaceName)) {
+    // Safe fallback if the local Ogre SDK is missing its HDR sample media.
+    compMgr->createBasicWorkspaceDef(
+        fallbackWorkspaceName, Ogre::ColourValue(0.48f, 0.68f, 0.94f, 1.0f),
+        Ogre::IdString("ApexForzaPssmShadowNode"));
 }
-compMgr->addWorkspace(ctx->sceneMgr, ctx->window->getTexture(), ctx->camera, wsName, true);
+const Ogre::String activeWorkspaceName =
+    hdrWorkspaceAvailable ? hdrWorkspaceName : fallbackWorkspaceName;
+compMgr->addWorkspace(
+    ctx->sceneMgr, ctx->window->getTexture(), ctx->camera, activeWorkspaceName, true);
 // --- نسيج أبيض افتراضي (id = 1) ---
 uint32_t white_pixel = 0xFFFFFFFF;
 ogre_create_texture(ctx, 1, 1, (const uint8_t*)&white_pixel, false);
