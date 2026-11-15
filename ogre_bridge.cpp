@@ -588,6 +588,23 @@ ctx->skyRimLight->setPowerScale(Ogre::Math::PI * (0.06f + 0.22f * day + 0.08f * 
 const Ogre::ColourValue ambientTop(0.012f + 0.30f * day + 0.06f * twilight, 0.018f + 0.34f * day + 0.035f * twilight, 0.045f + 0.42f * day);
 const Ogre::ColourValue ambientBottom(0.006f + 0.12f * day, 0.009f + 0.13f * day, 0.020f + 0.16f * day);
 ctx->sceneMgr->setAmbientLight(ambientTop, ambientBottom, Ogre::Vector3::UNIT_Y);
+
+// Atmospheric distance fog: use the fog colour already supplied by the Rust
+// environment bridge. A zero colour keeps fog disabled and preserves the
+// previous rendering behaviour for callers that do not provide fog settings.
+auto safeFogChannel = [](float value) -> float {
+    return std::isfinite(value) ? std::fmin(1.0f, std::fmax(0.0f, value)) : 0.0f;
+};
+const Ogre::ColourValue fogColour(
+    safeFogChannel(fog_r), safeFogChannel(fog_g), safeFogChannel(fog_b));
+const float fogStrength = std::fmax(fogColour.r, std::fmax(fogColour.g, fogColour.b));
+if (fogStrength > 0.001f) {
+    const float farDistance = std::fmax(100.0f, ctx->camera->getFarClipDistance());
+    ctx->sceneMgr->setFog(Ogre::FOG_LINEAR, fogColour, 0.001f,
+                          farDistance * 0.45f, farDistance * 0.95f);
+} else {
+    ctx->sceneMgr->setFog(Ogre::FOG_NONE);
+}
 }
 // ---------------------------------------------------------------------------
 // UI (2D)
