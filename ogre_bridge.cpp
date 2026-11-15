@@ -103,6 +103,9 @@ struct OgreContext {
 
 static OgreContext* g_active_ctx = nullptr;
 
+// Render screen-space UI after every 3D queue. 100 is Ogre's overlay queue.
+static constexpr uint8_t kUiRenderQueueGroup = 100;
+
 // ---------------------------------------------------------------------------
 // WndProc hook
 // ---------------------------------------------------------------------------
@@ -224,6 +227,23 @@ if (it == ctx->textures.end()) return;
     Ogre::TextureGpuManager* texMgr = ctx->root->getRenderSystem()->getTextureGpuManager();
 
     if (tex->getWidth() != width || tex->getHeight() != height) {
+        const uint32_t old_width = tex->getWidth();
+        const uint32_t old_height = tex->getHeight();
+
+        // A font atlas may grow in the middle of a frame. Earlier text batches
+        // already queued for this texture still contain UVs normalized to the
+        // old dimensions. Rescale those queued UVs before changing the texture,
+        // otherwise the earlier labels can sample the wrong glyph for one frame.
+        const float u_scale = static_cast<float>(old_width) / static_cast<float>(width);
+        const float v_scale = static_cast<float>(old_height) / static_cast<float>(height);
+        for (UiCmd& ui_cmd : ctx->ui_cmds) {
+            if (ui_cmd.tex_id != tex_id) continue;
+            for (BridgeVertex2D& vertex : ui_cmd.verts) {
+                vertex.u *= u_scale;
+                vertex.v *= v_scale;
+            }
+        }
+
         tex->scheduleTransitionTo(Ogre::GpuResidency::OnStorage);
         tex->setResolution(width, height);
         tex->scheduleTransitionTo(Ogre::GpuResidency::Resident);
@@ -332,9 +352,9 @@ ctx->skyRimLight->setDirection(Ogre::Vector3(0.5f, -0.35f, 0.6f).normalisedCopy(
 ctx->skyRimLight->setPowerScale(Ogre::Math::PI * 0.45f);
 // --- طبقة الواجهة: ابن مباشر لعقدة الكاميرا ---
 ctx->uiManual = ctx->sceneMgr->createManualObject(Ogre::SCENE_DYNAMIC);
-ctx->uiManual->setRenderQueueGroup(1);
-// Keep alpha-blended UI batches in submission order; material sorting caused flicker.
-ctx->sceneMgr->getRenderQueue()->setSortRenderQueue(1, Ogre::RenderQueue::DisableSort);
+ctx->uiManual->setRenderQueueGroup(kUiRenderQueueGroup);
+// Overlay queue: keep alpha-blended UI after the 3D scene and preserve submission order.
+ctx->sceneMgr->getRenderQueue()->setSortRenderQueue(kUiRenderQueueGroup, Ogre::RenderQueue::DisableSort);
 ctx->uiManual->setCastShadows(false);
 ctx->uiManual->setLocalAabb(Ogre::Aabb::BOX_INFINITE);
 ctx->uiNode = ctx->camNode->createChildSceneNode(Ogre::SCENE_DYNAMIC);
@@ -620,24 +640,31 @@ const BridgeVertex2D* verts, uint32_t vcount,
 const uint16_t* indices, uint32_t icount,
 uint32_t tex_id)
 {
-if (!raw_ctx || vcount == 0 || icount == 0) return;
+// Every 2D batch is a triangle list with 16-bit local indices. Reject malformed
+// input before it can wrap an index while batches are merged.
+if (!raw_ctx || !verts || !indices || vcount < 3 || icount < 3 ||
+    vcount >= 60000 || icount > 180000 || (icount % 3) != 0) return;
+for (uint32_t i = 0; i < icount; ++i) {
+    if (indices[i] >= vcount) return;
+}
+
 OgreContext* ctx = (OgreContext*)raw_ctx;
 uint32_t tid = (tex_id == 0) ? 1 : tex_id;
 if (!ctx->ui_cmds.empty() &&
-ctx->ui_cmds.back().tex_id == tid &&
-ctx->ui_cmds.back().verts.size() + vcount < 60000) {
-UiCmd& cmd = ctx->ui_cmds.back();
-uint16_t base = (uint16_t)cmd.verts.size();
-cmd.verts.insert(cmd.verts.end(), verts, verts + vcount);
-for (uint32_t i = 0; i < icount; ++i) {
-cmd.indices.push_back((uint16_t)(base + indices[i]));
-}
+    ctx->ui_cmds.back().tex_id == tid &&
+    ctx->ui_cmds.back().verts.size() + static_cast<size_t>(vcount) < 60000) {
+    UiCmd& cmd = ctx->ui_cmds.back();
+    const size_t base = cmd.verts.size();
+    cmd.verts.insert(cmd.verts.end(), verts, verts + vcount);
+    for (uint32_t i = 0; i < icount; ++i) {
+        cmd.indices.push_back(static_cast<uint16_t>(base + indices[i]));
+    }
 } else {
-UiCmd cmd;
-cmd.tex_id = tid;
-cmd.verts.assign(verts, verts + vcount);
-cmd.indices.assign(indices, indices + icount);
-ctx->ui_cmds.push_back(std::move(cmd));
+    UiCmd cmd;
+    cmd.tex_id = tid;
+    cmd.verts.assign(verts, verts + vcount);
+    cmd.indices.assign(indices, indices + icount);
+    ctx->ui_cmds.push_back(std::move(cmd));
 }
 }
 // ---------------------------------------------------------------------------
@@ -668,16 +695,18 @@ cm.pool_objs[i]->setVisible(false);
 }
 // بناء الواجهة (uiNode ابن لـ camNode فتتبع الكاميرا مباشرة)
 ctx->uiManual->clear();
+ctx->uiManual->setRenderQueueGroup(kUiRenderQueueGroup);
+ctx->uiManual->setLocalAabb(Ogre::Aabb::BOX_INFINITE);
+ctx->sceneMgr->getRenderQueue()->setSortRenderQueue(kUiRenderQueueGroup, Ogre::RenderQueue::DisableSort);
 float sw = (float)(ctx->window->getWidth()  > 0 ? ctx->window->getWidth()  : 1);
 float sh = (float)(ctx->window->getHeight() > 0 ? ctx->window->getHeight() : 1);
 float aspect = sw / sh;
 const float base_d = 1.5f;
 float tan_half_fov = std::tan(ctx->camera->getFOVy().valueRadians() * 0.5f);
-for (size_t ci = 0; ci < ctx->ui_cmds.size(); ++ci) {
-const UiCmd& cmd = ctx->ui_cmds[ci];
-if (cmd.indices.size() < 3) continue;
-// إزاحة عمق صغيرة لكل طبقة
-float d = base_d - (float)ci * 0.0005f;
+for (const UiCmd& cmd : ctx->ui_cmds) {
+if (cmd.verts.size() < 3 || cmd.indices.size() < 3) continue;
+// All UI batches share one camera-space plane; painter order is the batch order.
+const float d = base_d;
 float half_h = d * tan_half_fov;
 float half_w = half_h * aspect;
 std::string dbName = getOrCreateUiDatablockName(ctx, cmd.tex_id);
