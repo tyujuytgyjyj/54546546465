@@ -585,6 +585,11 @@ cm.pool_db_names[idx] = dbName;
 }
 Ogre::ManualObject* mo   = cm.pool_objs[idx];
 Ogre::SceneNode*    node = cm.pool_nodes[idx];
+// Transparent meshes must be rendered after opaque world geometry but before UI.
+// Keeping them in queue 0 makes water/glass order depend on opaque material sorting.
+const bool is_transparent = cm.is_water || is_glass || cm.is_glass;
+mo->setRenderQueueGroup(is_transparent ? Ogre::RENDER_QUEUE_TRANSPARENTS : 0);
+mo->setCastShadows(!is_transparent);
 mo->setVisible(true);
 node->setPosition(Ogre::Vector3(px, py, pz));
 node->setOrientation(Ogre::Quaternion(qw, qx, qy, qz));  // ترتيب Ogre: w,x,y,z
