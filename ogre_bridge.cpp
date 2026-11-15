@@ -590,11 +590,11 @@ return dbName;
 // ---------------------------------------------------------------------------
 static float skyClamp01(float x);
 static float skySmoothstep(float a, float b, float x);
-static Ogre::Vector3 skyColourForRay(const Ogre::Vector3& rayWorld,
-                                     const Ogre::Vector3& sunDirWorld,
-                                     float sunElevation,
-                                     const Ogre::Vector3& observerWorld,
-                                     float timeSeconds);
+static Ogre::Vector3 waterReflectionColour(const Ogre::Vector3& rayWorld,
+                                           const Ogre::Vector3& sunDirWorld,
+                                           float sunElevation,
+                                           const Ogre::Vector3& observerWorld,
+                                           float timeSeconds);
 
 BRIDGE_API void ogre_draw_mesh_trs(
 void* raw_ctx, uint32_t mesh_id,
@@ -684,7 +684,7 @@ if (cm.is_water) {
         if (reflected.squaredLength() < 1.0e-6f) reflected = Ogre::Vector3::UNIT_Y;
         else reflected.normalise();
 
-        const Ogre::Vector3 reflectedSky = skyColourForRay(
+        const Ogre::Vector3 reflectedSky = waterReflectionColour(
             reflected, sunDirection, ctx->skySunElevation, worldPosition, waveTime);
         const Ogre::Vector3 sourceColour(src.r / 255.0f, src.g / 255.0f, src.b / 255.0f);
         const Ogre::Vector3 deepWater(
@@ -692,7 +692,7 @@ if (cm.is_water) {
             0.034f + sourceColour.y * 0.075f,
             0.050f + sourceColour.z * 0.095f);
         const float fresnel = 0.02f + 0.98f * std::pow(1.0f - ndv, 5.0f);
-        const float reflectionWeight = 0.20f + 0.74f * fresnel;
+        const float reflectionWeight = 0.34f + 0.62f * fresnel;
         Ogre::Vector3 waterColour =
             deepWater * (1.0f - reflectionWeight) +
             reflectedSky * (reflectionWeight * 0.88f);
@@ -996,6 +996,88 @@ static Ogre::Vector3 skyColourForRay(const Ogre::Vector3& rayWorld,
     }
     return Ogre::Vector3(skyClamp01(colour.x), skyClamp01(colour.y), skyClamp01(colour.z));
 }
+static Ogre::Vector3 waterReflectionColour(const Ogre::Vector3& rayWorld,
+                                           const Ogre::Vector3& sunDirWorld,
+                                           float sunElevation,
+                                           const Ogre::Vector3& observerWorld,
+                                           float timeSeconds) {
+    const Ogre::Vector3 ray = rayWorld.normalisedCopy();
+    const Ogre::Vector3 sun = sunDirWorld.normalisedCopy();
+    const float day = skySmoothstep(-0.10f, 0.25f, sunElevation);
+    const float twilight = skySmoothstep(-0.24f, 0.015f, sunElevation) *
+                           (1.0f - skySmoothstep(0.06f, 0.34f, sunElevation));
+    const float night = 1.0f - skySmoothstep(-0.16f, 0.035f, sunElevation);
+
+    const Ogre::Vector3 zenNight(0.004f, 0.008f, 0.024f);
+    const Ogre::Vector3 zenDay(0.018f, 0.105f, 0.34f);
+    const Ogre::Vector3 zenTwilight(0.020f, 0.032f, 0.115f);
+    const Ogre::Vector3 horNight(0.010f, 0.018f, 0.044f);
+    const Ogre::Vector3 horDay(0.50f, 0.69f, 0.88f);
+    const Ogre::Vector3 horSun(1.15f, 0.34f, 0.105f);
+    const Ogre::Vector3 horAnti(0.24f, 0.13f, 0.30f);
+
+    Ogre::Vector3 sunFlat(sun.x, 0.0f, sun.z);
+    if (sunFlat.squaredLength() < 1.0e-4f) sunFlat = Ogre::Vector3::UNIT_Z;
+    sunFlat.normalise();
+    Ogre::Vector3 rayFlat(ray.x, 0.0f, ray.z);
+    if (rayFlat.squaredLength() < 1.0e-4f) rayFlat = Ogre::Vector3::UNIT_Z;
+    rayFlat.normalise();
+    const float azimuth = skyClamp01(sunFlat.dotProduct(rayFlat) * 0.5f + 0.5f);
+
+    Ogre::Vector3 zen = skyMix(zenNight, zenDay, day);
+    zen = skyMix(zen, zenTwilight, twilight);
+    Ogre::Vector3 horizon = skyMix(horNight, horDay, day);
+    horizon = skyMix(horizon,
+        skyMix(horAnti, horSun, std::pow(azimuth, 1.42f)), twilight);
+    Ogre::Vector3 result = skyMix(horizon, zen, std::pow(skyClamp01(ray.y), 0.50f));
+
+    const float sunDot = std::fmax(ray.dotProduct(sun), 0.0f);
+    const float sunVisible = skySmoothstep(-0.10f, 0.035f, sunElevation);
+    const Ogre::Vector3 sunTint = skyMix(
+        Ogre::Vector3(1.75f, 0.43f, 0.10f),
+        Ogre::Vector3(1.15f, 0.93f, 0.73f),
+        skySmoothstep(0.0f, 0.32f, sunElevation));
+    result += sunTint * (
+        std::pow(sunDot, 280.0f) * 1.55f +
+        std::pow(sunDot, 14.0f) * (0.10f + 0.30f * twilight) * sunVisible);
+
+    // One compact cloud sample per water vertex; it tracks the same wind and
+    // large-scale cumulus field as the detailed camera sky at a lower CPU cost.
+    if (ray.y > -0.005f) {
+        const float projY = std::fmax(ray.y, 0.035f);
+        const float distance = std::fmax((1050.0f - observerWorld.y) / projY, 0.0f);
+        const float cloudX = observerWorld.x + ray.x * distance + timeSeconds * 7.5f;
+        const float cloudZ = observerWorld.z + ray.z * distance - timeSeconds * 3.2f;
+        const float px = cloudX * 0.00115f;
+        const float pz = cloudZ * 0.00115f;
+        const float broad = skyFbm2(px, pz);
+        const float detail = skyNoise2(px * 2.7f + 11.2f, pz * 2.7f - 6.4f);
+        const float density = skySmoothstep(0.555f, 0.685f, broad * 0.76f + detail * 0.24f);
+        const Ogre::Vector3 topDay(1.18f, 1.20f, 1.18f);
+        const Ogre::Vector3 bottomDay(0.40f, 0.49f, 0.62f);
+        const Ogre::Vector3 topTwilight(1.48f, 0.66f, 0.31f);
+        const Ogre::Vector3 bottomTwilight(0.17f, 0.105f, 0.20f);
+        const Ogre::Vector3 topNight(0.075f, 0.095f, 0.15f);
+        const Ogre::Vector3 bottomNight(0.012f, 0.018f, 0.038f);
+        Ogre::Vector3 top = skyMix(topNight, topDay, day);
+        top = skyMix(top, topTwilight, twilight);
+        Ogre::Vector3 bottom = skyMix(bottomNight, bottomDay, day);
+        bottom = skyMix(bottom, bottomTwilight, twilight);
+        const float cloudLight = skyClamp01(0.35f + detail * 0.48f + sunVisible * 0.12f);
+        Ogre::Vector3 cloud = skyMix(bottom, top, cloudLight);
+        cloud += sunTint * (std::pow(sunDot, 5.0f) * (0.25f + 0.55f * twilight) * sunVisible);
+        result = skyMix(result, cloud, density * 0.94f);
+    }
+
+    if (night > 0.01f) {
+        Ogre::Vector3 moon(-sun.x, std::fmax(-sun.y, 0.16f), -sun.z);
+        if (moon.squaredLength() > 1.0e-4f) moon.normalise();
+        result += Ogre::Vector3(0.12f, 0.18f, 0.32f) *
+                  std::pow(std::fmax(ray.dotProduct(moon), 0.0f), 22.0f) * night * 0.55f;
+    }
+    return Ogre::Vector3(skyClamp01(result.x), skyClamp01(result.y), skyClamp01(result.z));
+}
+
 static void updateSkyGradient(OgreContext* ctx, float sw, float sh) {
     if (!ctx || !ctx->skyManual || !ctx->camera || !ctx->camNode) return;
     const float aspect = sw / std::fmax(sh, 1.0f);
