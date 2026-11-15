@@ -59,6 +59,7 @@ struct CachedMesh {
     float base_a = 1.0f;
     bool is_glass = false;
     bool is_water = false;
+    std::vector<BridgeVertex3D> animated_verts;
 
     std::vector<Ogre::ManualObject*> pool_objs;
     std::vector<Ogre::SceneNode*> pool_nodes;
@@ -83,6 +84,10 @@ struct OgreContext {
     Ogre::SceneNode* camNode = nullptr;
     Ogre::Light* sunLight = nullptr;
     Ogre::Light* skyRimLight = nullptr;
+    Ogre::ManualObject* skyManual = nullptr;
+    Ogre::SceneNode* skyNode = nullptr;
+    Ogre::Vector3 skySunDir = Ogre::Vector3(0.35f, 0.15f, 0.4f);
+    float skySunElevation = 0.15f;
 
     Ogre::ManualObject* uiManual = nullptr;
     Ogre::SceneNode* uiNode = nullptr;
@@ -104,8 +109,10 @@ struct OgreContext {
 
 static OgreContext* g_active_ctx = nullptr;
 
-// Render screen-space UI after every 3D queue. 100 is Ogre's overlay queue.
-static constexpr uint8_t kUiRenderQueueGroup = 100;
+// Keep explicit scene ordering: background/sky, opaque world, transparent water/glass, UI.
+static constexpr uint8_t kSkyRenderQueueGroup = Ogre::RENDER_QUEUE_SKIES_EARLY;
+static constexpr uint8_t kWorldRenderQueueGroup = Ogre::RENDER_QUEUE_MAIN;
+static constexpr uint8_t kUiRenderQueueGroup = Ogre::RENDER_QUEUE_OVERLAY;
 
 // ---------------------------------------------------------------------------
 // WndProc hook
@@ -360,12 +367,30 @@ ctx->uiManual->setCastShadows(false);
 ctx->uiManual->setLocalAabb(Ogre::Aabb::BOX_INFINITE);
 ctx->uiNode = ctx->camNode->createChildSceneNode(Ogre::SCENE_DYNAMIC);
 ctx->uiNode->attachObject(ctx->uiManual);
+
+// Procedural camera-following sky gradient. The Macroquad sky shader is not
+// executed by the Ogre bridge, so this supplies the missing real sky pass.
+Ogre::HlmsUnlit* skyUnlit = (Ogre::HlmsUnlit*)ctx->root->getHlmsManager()->getHlms(Ogre::HLMS_UNLIT);
+Ogre::HlmsMacroblock skyMacro;
+skyMacro.mDepthCheck = false;
+skyMacro.mDepthWrite = false;
+skyMacro.mCullMode = Ogre::CULL_NONE;
+Ogre::HlmsBlendblock skyBlend;
+skyUnlit->createDatablock("ApexSkyGradient", "ApexSkyGradient", skyMacro, skyBlend, Ogre::HlmsParamVec());
+ctx->skyManual = ctx->sceneMgr->createManualObject(Ogre::SCENE_DYNAMIC);
+ctx->skyManual->setRenderQueueGroup(kSkyRenderQueueGroup);
+ctx->skyManual->setCastShadows(false);
+ctx->skyManual->setLocalAabb(Ogre::Aabb::BOX_INFINITE);
+ctx->skyNode = ctx->camNode->createChildSceneNode(Ogre::SCENE_DYNAMIC);
+ctx->skyNode->attachObject(ctx->skyManual);
+ctx->sceneMgr->getRenderQueue()->setSortRenderQueue(kSkyRenderQueueGroup, Ogre::RenderQueue::DisableSort);
+
 // --- Workspace أساسي ---
 Ogre::CompositorManager2* compMgr = ctx->root->getCompositorManager2();
 const Ogre::String wsName = "ApexBasicWS";
 if (!compMgr->hasWorkspaceDefinition(wsName)) {
 compMgr->createBasicWorkspaceDef(
-wsName, Ogre::ColourValue(0.48f, 0.68f, 0.94f, 1.0f), Ogre::IdString());
+wsName, Ogre::ColourValue(0.006f, 0.012f, 0.028f, 1.0f), Ogre::IdString());
 }
 compMgr->addWorkspace(ctx->sceneMgr, ctx->window->getTexture(), ctx->camera, wsName, true);
 // --- نسيج أبيض افتراضي (id = 1) ---
@@ -420,6 +445,7 @@ cm.cpu_indices.assign(indices, indices + icount);
 cm.tex_id   = (tex_id == 0) ? 1 : tex_id;
 cm.is_glass = is_glass;
 cm.is_water = is_water;
+if (is_water) cm.animated_verts = cm.cpu_verts;
 cm.avg_spec = verts->spec;
 cm.base_a   = verts->a / 255.0f;
 ctx->meshes[id] = std::move(cm);
@@ -437,6 +463,7 @@ if (it == ctx->meshes.end()) return;
 CachedMesh& cm = it->second;
 cm.cpu_verts.assign(verts, verts + vcount);
 cm.cpu_indices.assign(indices, indices + icount);
+if (cm.is_water) cm.animated_verts = cm.cpu_verts;
 cm.avg_spec = verts->spec;
 for (size_t i = 0; i < cm.pool_objs.size(); ++i) {
 populateManualObject(cm.pool_objs[i], cm.pool_db_names[i], cm.cpu_verts, cm.cpu_indices);
@@ -488,16 +515,16 @@ std::string dbName = "ApexPBS_" + std::to_string(key);
 Ogre::HlmsPbsDatablock* db = (Ogre::HlmsPbsDatablock*)hlmsPbs->createDatablock(
 dbName, dbName, macro, blend, Ogre::HlmsParamVec());
 if (water && !is_cutout) {
-// Dedicated water response: dark blue body, low dielectric F0 and a tight
-// specular lobe. Unlike vehicle glass, water remains mostly opaque and uses
-// a restrained transparent PBS mode so the surface does not wash out.
+// Water has a dark teal body, dielectric Fresnel and a sharp highlight.
+// Keep it almost opaque: the reflection/specular response, not alpha washing,
+// should provide most of its visual energy.
 db->setWorkflow(Ogre::HlmsPbsDatablock::SpecularAsFresnelWorkflow);
-db->setDiffuse(Ogre::Vector3(0.16f, 0.32f, 0.39f));
-db->setSpecular(Ogre::Vector3(0.92f, 0.97f, 1.0f));
-db->setFresnel(Ogre::Vector3(0.02f, 0.02f, 0.02f), false);
-db->setRoughness(0.075f);
-db->setTransparency(0.88f, Ogre::HlmsPbsDatablock::Transparent, false, false);
-db->setTwoSidedLighting(true);
+db->setDiffuse(Ogre::Vector3(0.22f, 0.43f, 0.56f));
+db->setSpecular(Ogre::Vector3(0.96f, 0.985f, 1.0f));
+db->setFresnel(Ogre::Vector3(0.035f, 0.035f, 0.035f), false);
+db->setRoughness(0.065f);
+db->setTransparency(0.96f, Ogre::HlmsPbsDatablock::Transparent, false, false);
+db->setTwoSidedLighting(true, false);
 } else if (spec > 2.0f && spec < 2.5f) {
 // Automotive metallic base coat with Ogre PBS clear-coat layer.
 db->setWorkflow(Ogre::HlmsPbsDatablock::MetallicWorkflow);
@@ -571,7 +598,7 @@ cm.avg_spec, is_glass || cm.is_glass, cm.is_water, cm.base_a);
 size_t idx = cm.used_this_frame++;
 if (idx >= cm.pool_objs.size()) {
 Ogre::ManualObject* newObj = ctx->sceneMgr->createManualObject(Ogre::SCENE_DYNAMIC);
-newObj->setRenderQueueGroup(0);
+newObj->setRenderQueueGroup(kWorldRenderQueueGroup);
 populateManualObject(newObj, dbName, cm.cpu_verts, cm.cpu_indices);
 Ogre::SceneNode* newNode = ctx->sceneMgr->getRootSceneNode(Ogre::SCENE_DYNAMIC)
 ->createChildSceneNode(Ogre::SCENE_DYNAMIC);
@@ -588,9 +615,35 @@ Ogre::SceneNode*    node = cm.pool_nodes[idx];
 // Transparent meshes must be rendered after opaque world geometry but before UI.
 // Keeping them in queue 0 makes water/glass order depend on opaque material sorting.
 const bool is_transparent = cm.is_water || is_glass || cm.is_glass;
-mo->setRenderQueueGroup(is_transparent ? Ogre::RENDER_QUEUE_TRANSPARENTS : 0);
+mo->setRenderQueueGroup(is_transparent ? Ogre::RENDER_QUEUE_TRANSPARENTS : kWorldRenderQueueGroup);
 mo->setCastShadows(!is_transparent);
 mo->setVisible(true);
+if (cm.is_water) {
+    // Low-amplitude multi-directional waves; normals are derived analytically
+    // so water highlights move instead of remaining a flat plastic sheet.
+    const float waveTime = static_cast<float>(GetTickCount64()) * 0.001f;
+    auto& waveVerts = cm.animated_verts;
+    if (waveVerts.size() != cm.cpu_verts.size()) waveVerts.resize(cm.cpu_verts.size());
+    for (size_t vi = 0; vi < cm.cpu_verts.size(); ++vi) {
+        const BridgeVertex3D& src = cm.cpu_verts[vi];
+        BridgeVertex3D& dst = waveVerts[vi];
+        dst = src;
+        const float x = src.px;
+        const float z = src.pz;
+        const float a = x * 0.17f + z * 0.11f + waveTime * 0.82f;
+        const float b = x * -0.13f + z * 0.21f - waveTime * 1.07f;
+        const float d = x * 0.31f - z * 0.27f + waveTime * 1.43f;
+        const float ca = std::cos(a), cb = std::cos(b), cd = std::cos(d);
+        dst.py += 0.026f * std::sin(a) + 0.014f * std::sin(b) + 0.006f * std::sin(d);
+        Ogre::Vector3 n(
+            -(0.026f * 0.17f * ca - 0.014f * 0.13f * cb + 0.006f * 0.31f * cd),
+            1.0f,
+            -(0.026f * 0.11f * ca + 0.014f * 0.21f * cb - 0.006f * 0.27f * cd));
+        n.normalise();
+        dst.nx = n.x; dst.ny = n.y; dst.nz = n.z;
+    }
+    populateManualObject(mo, dbName, waveVerts, cm.cpu_indices);
+}
 node->setPosition(Ogre::Vector3(px, py, pz));
 node->setOrientation(Ogre::Quaternion(qw, qx, qy, qz));  // ترتيب Ogre: w,x,y,z
 node->setScale(Ogre::Vector3(sx, sy, sz));
@@ -615,7 +668,12 @@ BRIDGE_API void ogre_set_env(void* raw_ctx,
 float sun_x, float sun_y, float sun_z,
 float fog_r, float fog_g, float fog_b,
 float sun_elev) {
+if (!raw_ctx) return;
 OgreContext* ctx = (OgreContext*)raw_ctx;
+ctx->skySunElevation = sun_elev;
+ctx->skySunDir = Ogre::Vector3(sun_x, sun_elev, sun_z);
+if (ctx->skySunDir.squaredLength() < 1.0e-4f) ctx->skySunDir = Ogre::Vector3(0.4f, 0.2f, 0.3f);
+ctx->skySunDir.normalise();
 Ogre::Vector3 dir(-sun_x, -sun_y, -sun_z);
 if (dir.squaredLength() < 1e-4f) dir = Ogre::Vector3(-0.4f, -0.8f, -0.3f);
 dir.normalise();
@@ -623,10 +681,10 @@ ctx->sunLight->setDirection(dir);
 ctx->skyRimLight->setDirection(Ogre::Vector3(-dir.x, -0.35f, -dir.z).normalisedCopy());
 float day = std::fmin(1.0f, std::fmax(0.0f, (sun_elev + 0.12f) / 0.42f));
 float twilight = std::fmax(0.0f, 1.0f - std::fabs(sun_elev) / 0.22f);
-ctx->sunLight->setPowerScale(Ogre::Math::PI * (0.015f + 1.55f * day + 0.20f * twilight));
-ctx->skyRimLight->setPowerScale(Ogre::Math::PI * (0.06f + 0.22f * day + 0.08f * twilight));
-const Ogre::ColourValue ambientTop(0.012f + 0.30f * day + 0.06f * twilight, 0.018f + 0.34f * day + 0.035f * twilight, 0.045f + 0.42f * day);
-const Ogre::ColourValue ambientBottom(0.006f + 0.12f * day, 0.009f + 0.13f * day, 0.020f + 0.16f * day);
+ctx->sunLight->setPowerScale(Ogre::Math::PI * (0.035f + 1.35f * day + 0.50f * twilight));
+ctx->skyRimLight->setPowerScale(Ogre::Math::PI * (0.10f + 0.24f * day + 0.30f * twilight));
+const Ogre::ColourValue ambientTop(0.018f + 0.30f * day + 0.20f * twilight, 0.026f + 0.35f * day + 0.11f * twilight, 0.055f + 0.48f * day + 0.18f * twilight);
+const Ogre::ColourValue ambientBottom(0.012f + 0.10f * day + 0.055f * twilight, 0.015f + 0.11f * day + 0.035f * twilight, 0.025f + 0.14f * day + 0.040f * twilight);
 ctx->sceneMgr->setAmbientLight(ambientTop, ambientBottom, Ogre::Vector3::UNIT_Y);
 }
 // ---------------------------------------------------------------------------
@@ -687,6 +745,105 @@ if (!ctx->ui_cmds.empty() &&
     ctx->ui_cmds.push_back(std::move(cmd));
 }
 }
+
+// ---------------------------------------------------------------------------
+// Procedural atmospheric sky pass (camera-following, rendered before world)
+// ---------------------------------------------------------------------------
+static float skyClamp01(float x) {
+    return std::fmax(0.0f, std::fmin(1.0f, x));
+}
+static float skySmoothstep(float a, float b, float x) {
+    const float t = skyClamp01((x - a) / (b - a));
+    return t * t * (3.0f - 2.0f * t);
+}
+static Ogre::Vector3 skyMix(const Ogre::Vector3& a, const Ogre::Vector3& b, float t) {
+    return a * (1.0f - t) + b * t;
+}
+static Ogre::Vector3 skyColourForRay(const Ogre::Vector3& ray,
+                                     const Ogre::Vector3& sunDirLocal,
+                                     float sunElevation) {
+    const float day = skySmoothstep(-0.10f, 0.25f, sunElevation);
+    const float twilight = skySmoothstep(-0.24f, 0.015f, sunElevation) *
+                           (1.0f - skySmoothstep(0.06f, 0.34f, sunElevation));
+    const float night = 1.0f - skySmoothstep(-0.16f, 0.035f, sunElevation);
+
+    const Ogre::Vector3 zenNight(0.006f, 0.012f, 0.032f);
+    const Ogre::Vector3 zenDay(0.025f, 0.12f, 0.39f);
+    const Ogre::Vector3 zenTwilight(0.025f, 0.040f, 0.135f);
+    const Ogre::Vector3 horNight(0.012f, 0.021f, 0.052f);
+    const Ogre::Vector3 horDay(0.48f, 0.66f, 0.86f);
+    const Ogre::Vector3 horSun(1.00f, 0.27f, 0.075f);
+    const Ogre::Vector3 horAnti(0.20f, 0.12f, 0.28f);
+
+    Ogre::Vector3 sunFlat(sunDirLocal.x, 0.0f, sunDirLocal.z);
+    if (sunFlat.squaredLength() < 1.0e-4f) sunFlat = Ogre::Vector3::UNIT_Z;
+    sunFlat.normalise();
+    Ogre::Vector3 rayFlat(ray.x, 0.0f, ray.z);
+    if (rayFlat.squaredLength() < 1.0e-4f) rayFlat = Ogre::Vector3::UNIT_Z;
+    rayFlat.normalise();
+    const float azimuth = skyClamp01(sunFlat.dotProduct(rayFlat) * 0.5f + 0.5f);
+
+    Ogre::Vector3 zen = skyMix(zenNight, zenDay, day);
+    zen = skyMix(zen, zenTwilight, twilight * 0.92f);
+    Ogre::Vector3 horizon = skyMix(horNight, horDay, day);
+    const Ogre::Vector3 warmHorizon = skyMix(horAnti, horSun, std::pow(azimuth, 1.45f));
+    horizon = skyMix(horizon, warmHorizon, twilight);
+
+    const float y = skyClamp01(ray.y);
+    const float vertical = std::pow(y, 0.52f);
+    Ogre::Vector3 colour = skyMix(horizon, zen, vertical);
+
+    // A broad low-altitude glow toward the sun gives sunsets depth without
+    // flattening the whole horizon into one orange strip.
+    const float haze = std::exp(-y * 11.0f) * std::pow(azimuth, 2.0f) * twilight;
+    colour += Ogre::Vector3(0.22f, 0.075f, 0.018f) * haze;
+
+    const float sunDot = std::fmax(ray.dotProduct(sunDirLocal.normalisedCopy()), 0.0f);
+    const float disc = std::pow(sunDot, 180.0f) * skySmoothstep(-0.025f, 0.04f, sunElevation);
+    const float halo = std::pow(sunDot, 12.0f) * twilight * 0.12f;
+    colour += Ogre::Vector3(1.0f, 0.72f, 0.40f) * (disc * 1.6f + halo);
+    return Ogre::Vector3(skyClamp01(colour.x), skyClamp01(colour.y), skyClamp01(colour.z));
+}
+static void updateSkyGradient(OgreContext* ctx, float sw, float sh) {
+    if (!ctx || !ctx->skyManual || !ctx->camera || !ctx->camNode) return;
+    const float aspect = sw / std::fmax(sh, 1.0f);
+    const float d = 1.0f;
+    const float tanHalf = std::tan(ctx->camera->getFOVy().valueRadians() * 0.5f);
+    const float halfH = d * tanHalf * 1.08f;
+    const float halfW = halfH * aspect;
+    const Ogre::Vector3 sunLocal = ctx->camNode->getOrientation().Inverse() * ctx->skySunDir;
+
+    constexpr int cols = 32;
+    constexpr int rows = 12;
+    ctx->skyManual->clear();
+    ctx->skyManual->setRenderQueueGroup(kSkyRenderQueueGroup);
+    ctx->skyManual->setLocalAabb(Ogre::Aabb::BOX_INFINITE);
+    ctx->skyManual->begin("ApexSkyGradient", Ogre::OT_TRIANGLE_LIST);
+    for (int y = 0; y <= rows; ++y) {
+        const float ny = 1.08f - 2.16f * static_cast<float>(y) / static_cast<float>(rows);
+        for (int x = 0; x <= cols; ++x) {
+            const float nx = -1.08f + 2.16f * static_cast<float>(x) / static_cast<float>(cols);
+            Ogre::Vector3 ray(nx * aspect * tanHalf, ny * tanHalf, -1.0f);
+            ray.normalise();
+            const Ogre::Vector3 colour = skyColourForRay(ray, sunLocal, ctx->skySunElevation);
+            ctx->skyManual->position(nx * halfW, ny * halfH, -d);
+            ctx->skyManual->colour(colour.x, colour.y, colour.z, 1.0f);
+        }
+    }
+    for (int y = 0; y < rows; ++y) {
+        for (int x = 0; x < cols; ++x) {
+            const uint32_t a = static_cast<uint32_t>(y * (cols + 1) + x);
+            const uint32_t b = a + 1;
+            const uint32_t c0 = a + static_cast<uint32_t>(cols + 1);
+            const uint32_t d0 = c0 + 1;
+            ctx->skyManual->triangle(a, c0, b);
+            ctx->skyManual->triangle(b, c0, d0);
+        }
+    }
+    ctx->skyManual->end();
+    ctx->sceneMgr->getRenderQueue()->setSortRenderQueue(kSkyRenderQueueGroup, Ogre::RenderQueue::DisableSort);
+}
+
 // ---------------------------------------------------------------------------
 // Frame
 // ---------------------------------------------------------------------------
@@ -721,6 +878,7 @@ ctx->sceneMgr->getRenderQueue()->setSortRenderQueue(kUiRenderQueueGroup, Ogre::R
 float sw = (float)(ctx->window->getWidth()  > 0 ? ctx->window->getWidth()  : 1);
 float sh = (float)(ctx->window->getHeight() > 0 ? ctx->window->getHeight() : 1);
 float aspect = sw / sh;
+updateSkyGradient(ctx, sw, sh);
 const float base_d = 1.5f;
 float tan_half_fov = std::tan(ctx->camera->getFOVy().valueRadians() * 0.5f);
 for (const UiCmd& cmd : ctx->ui_cmds) {
