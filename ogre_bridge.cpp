@@ -58,6 +58,7 @@ struct CachedMesh {
     float avg_spec = 0.35f;
     float base_a = 1.0f;
     bool is_glass = false;
+    bool is_water = false;
 
     std::vector<Ogre::ManualObject*> pool_objs;
     std::vector<Ogre::SceneNode*> pool_nodes;
@@ -408,7 +409,7 @@ BRIDGE_API uint32_t ogre_upload_mesh(
 void* raw_ctx,
 const BridgeVertex3D* verts, uint32_t vcount,
 const uint16_t* indices, uint32_t icount,
-uint32_t tex_id, bool is_glass)
+uint32_t tex_id, bool is_glass, bool is_water)
 {
 OgreContext* ctx = (OgreContext*)raw_ctx;
 if (!ctx || !verts || !indices || vcount == 0 || icount < 3) return 0;
@@ -418,6 +419,7 @@ cm.cpu_verts.assign(verts, verts + vcount);
 cm.cpu_indices.assign(indices, indices + icount);
 cm.tex_id   = (tex_id == 0) ? 1 : tex_id;
 cm.is_glass = is_glass;
+cm.is_water = is_water;
 cm.avg_spec = verts->spec;
 cm.base_a   = verts->a / 255.0f;
 ctx->meshes[id] = std::move(cm);
@@ -441,7 +443,7 @@ populateManualObject(cm.pool_objs[i], cm.pool_db_names[i], cm.cpu_verts, cm.cpu_
 }
 }
 
-BRIDGE_API void ogre_set_mesh_material(void* raw_ctx, uint32_t mesh_id, uint32_t tex_id, bool is_glass) {
+BRIDGE_API void ogre_set_mesh_material(void* raw_ctx, uint32_t mesh_id, uint32_t tex_id, bool is_glass, bool is_water) {
     if (!raw_ctx) return;
     OgreContext* ctx = (OgreContext*)raw_ctx;
     auto it = ctx->meshes.find(mesh_id);
@@ -449,6 +451,7 @@ BRIDGE_API void ogre_set_mesh_material(void* raw_ctx, uint32_t mesh_id, uint32_t
     CachedMesh& cm = it->second;
     cm.tex_id = tex_id == 0 ? 1 : tex_id;
     cm.is_glass = is_glass;
+    cm.is_water = is_water;
 }
 
 // ---------------------------------------------------------------------------
@@ -457,7 +460,7 @@ BRIDGE_API void ogre_set_mesh_material(void* raw_ctx, uint32_t mesh_id, uint32_t
 static std::string getOrCreatePbsDatablockName(
 OgreContext* ctx, uint32_t tex_id,
 float tr, float tg, float tb,
-float spec, bool glass, float alpha)
+float spec, bool glass, bool water, float alpha)
 {
 uint32_t qr = (uint32_t)(tr * 63.0f) & 63;
 uint32_t qg = (uint32_t)(tg * 63.0f) & 63;
@@ -466,7 +469,8 @@ uint32_t qs = (uint32_t)((spec + 2.0f) * 20.0f) & 255;
 uint64_t key = ((uint64_t)tex_id << 32) |
 ((uint64_t)qr << 24) | ((uint64_t)qg << 18) |
 ((uint64_t)qb << 12) | ((uint64_t)qs << 2)  |
-(glass ? 1ULL : 0ULL);
+(glass ? 1ULL : 0ULL) |
+(water ? 2ULL : 0ULL);
 auto it = ctx->pbs_cache.find(key);
 if (it != ctx->pbs_cache.end()) return it->second;
 auto texIt = ctx->textures.find(tex_id == 0 ? 1 : tex_id);
@@ -476,14 +480,25 @@ Ogre::HlmsPbs* hlmsPbs =
 Ogre::HlmsMacroblock macro;
 Ogre::HlmsBlendblock blend;
 macro.mCullMode = Ogre::CULL_NONE;
-if (glass && !is_cutout) {
+if ((glass && !is_cutout) || (water && !is_cutout)) {
 macro.mDepthWrite = false;
 blend.setBlendType(Ogre::SBT_TRANSPARENT_ALPHA);
 }
 std::string dbName = "ApexPBS_" + std::to_string(key);
 Ogre::HlmsPbsDatablock* db = (Ogre::HlmsPbsDatablock*)hlmsPbs->createDatablock(
 dbName, dbName, macro, blend, Ogre::HlmsParamVec());
-if (spec > 2.0f && spec < 2.5f) {
+if (water && !is_cutout) {
+// Dedicated water response: dark blue body, low dielectric F0 and a tight
+// specular lobe. Unlike vehicle glass, water remains mostly opaque and uses
+// a restrained transparent PBS mode so the surface does not wash out.
+db->setWorkflow(Ogre::HlmsPbsDatablock::SpecularAsFresnelWorkflow);
+db->setDiffuse(Ogre::Vector3(0.16f, 0.32f, 0.39f));
+db->setSpecular(Ogre::Vector3(0.92f, 0.97f, 1.0f));
+db->setFresnel(Ogre::Vector3(0.02f, 0.02f, 0.02f), false);
+db->setRoughness(0.075f);
+db->setTransparency(0.88f, Ogre::HlmsPbsDatablock::Transparent, false, false);
+db->setTwoSidedLighting(true);
+} else if (spec > 2.0f && spec < 2.5f) {
 // Automotive metallic base coat with Ogre PBS clear-coat layer.
 db->setWorkflow(Ogre::HlmsPbsDatablock::MetallicWorkflow);
 db->setDiffuse(Ogre::Vector3(tr * 0.92f, tg * 0.92f, tb * 0.92f));
@@ -552,7 +567,7 @@ if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pz) ||
 CachedMesh& cm = it->second;
 std::string dbName = getOrCreatePbsDatablockName(
 ctx, cm.tex_id, tint_r, tint_g, tint_b,
-cm.avg_spec, is_glass || cm.is_glass, cm.base_a);
+cm.avg_spec, is_glass || cm.is_glass, cm.is_water, cm.base_a);
 size_t idx = cm.used_this_frame++;
 if (idx >= cm.pool_objs.size()) {
 Ogre::ManualObject* newObj = ctx->sceneMgr->createManualObject(Ogre::SCENE_DYNAMIC);
