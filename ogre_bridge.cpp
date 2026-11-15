@@ -548,6 +548,8 @@ if (it == ctx->meshes.end()) return;
 CachedMesh& cm = it->second;
 cm.cpu_verts.assign(verts, verts + vcount);
 cm.cpu_indices.assign(indices, indices + icount);
+cm.animated_water_verts.clear();
+cm.last_water_update = std::chrono::steady_clock::time_point{};
 cm.avg_spec = verts->spec;
 for (size_t i = 0; i < cm.pool_objs.size(); ++i) {
 populateManualObject(cm.pool_objs[i], cm.pool_db_names[i], cm.cpu_verts, cm.cpu_indices);
@@ -562,9 +564,13 @@ BRIDGE_API void ogre_set_mesh_material(void* raw_ctx, uint32_t mesh_id, uint32_t
     CachedMesh& cm = it->second;
     cm.tex_id = tex_id == 0 ? 1 : tex_id;
     cm.is_glass = is_glass;
-    const bool waterChanged = cm.is_water != is_water;
+    const bool materialFlagsChanged = cm.is_water != is_water;
     cm.is_water = is_water;
-    if (waterChanged) for (Ogre::ManualObject* obj : cm.pool_objs)
+    if (materialFlagsChanged) {
+        cm.animated_water_verts.clear();
+        cm.last_water_update = std::chrono::steady_clock::time_point{};
+    }
+    for (Ogre::ManualObject* obj : cm.pool_objs)
         obj->setCastShadows(!cm.is_glass && !cm.is_water);
 }
 
@@ -707,6 +713,8 @@ Ogre::ManualObject* newObj = ctx->sceneMgr->createManualObject(Ogre::SCENE_DYNAM
 newObj->setRenderQueueGroup(0);
 newObj->setCastShadows(!cm.is_glass && !is_glass && !cm.is_water);
 if (!cm.is_water) populateManualObject(newObj, dbName, cm.cpu_verts, cm.cpu_indices);
+else if (!cm.animated_water_verts.empty())
+    populateManualObject(newObj, dbName, cm.animated_water_verts, cm.cpu_indices);
 Ogre::SceneNode* newNode = ctx->sceneMgr->getRootSceneNode(Ogre::SCENE_DYNAMIC)
 ->createChildSceneNode(Ogre::SCENE_DYNAMIC);
 newNode->attachObject(newObj);
