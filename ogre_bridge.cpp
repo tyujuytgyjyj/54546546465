@@ -87,6 +87,7 @@ struct OgreContext {
     Ogre::SceneNode* camNode = nullptr;
     Ogre::Light* sunLight = nullptr;
     Ogre::Light* skyRimLight = nullptr;
+    Ogre::TextureGpu* environmentCubemap = nullptr;
     Ogre::ManualObject* skyManual = nullptr;
     Ogre::SceneNode* skyNode = nullptr;
     const std::string skyDbName = "ApexAtmosphereSky";
@@ -127,6 +128,121 @@ static Ogre::ColourValue apexMixColour(const Ogre::ColourValue& a,
                                         const Ogre::ColourValue& b, float t) {
     return Ogre::ColourValue(a.r + (b.r-a.r)*t, a.g + (b.g-a.g)*t,
                              a.b + (b.b-a.b)*t, 1.0f);
+}
+
+// ---------------------------------------------------------------------------
+// Global sky IBL cubemap. It provides a mipmapped reflection source to PBS
+// materials when no authored reflection probes are available in the level.
+// ---------------------------------------------------------------------------
+static Ogre::Vector3 apexCubeDirection(unsigned int face, float u, float v) {
+    Ogre::Vector3 d;
+    switch(face) {
+        case 0: d=Ogre::Vector3( 1.0f, -v, -u); break;
+        case 1: d=Ogre::Vector3(-1.0f, -v,  u); break;
+        case 2: d=Ogre::Vector3( u,  1.0f,  v); break;
+        case 3: d=Ogre::Vector3( u, -1.0f, -v); break;
+        case 4: d=Ogre::Vector3( u, -v,  1.0f); break;
+        default:d=Ogre::Vector3(-u, -v, -1.0f); break;
+    }
+    d.normalise();
+    return d;
+}
+static uint8_t apexLinearToSrgb(float value) {
+    value=apexClamp01(value);
+    const float encoded=value<=0.0031308f ? value*12.92f :
+        1.055f*std::pow(value,1.0f/2.4f)-0.055f;
+    return (uint8_t)std::fmin(255.0f,std::fmax(0.0f,encoded*255.0f+0.5f));
+}
+static Ogre::Vector3 apexSampleSkyIbl(const Ogre::Vector3& direction,
+                                     const Ogre::Vector3& sunDirection,
+                                     float sunElev,
+                                     const Ogre::ColourValue& fogColour,
+                                     float mipBlur) {
+    const float day=apexSmooth(-0.08f,0.22f,sunElev);
+    const float twilight=apexClamp01(1.0f-std::fabs(sunElev)/0.24f);
+    const Ogre::Vector3 nightH(0.008f,0.016f,0.038f);
+    const Ogre::Vector3 twiH(0.72f,0.23f,0.105f);
+    const Ogre::Vector3 dayH(0.52f,0.72f,0.95f);
+    const Ogre::Vector3 nightZ(0.0015f,0.0035f,0.014f);
+    const Ogre::Vector3 twiZ(0.025f,0.035f,0.105f);
+    const Ogre::Vector3 dayZ(0.025f,0.105f,0.34f);
+    Ogre::Vector3 horizon=nightH+(Ogre::Vector3(fogColour.r,fogColour.g,fogColour.b)-nightH)*day;
+    horizon=horizon+(twiH-horizon)*(twilight*0.48f);
+    Ogre::Vector3 zenith=nightZ+(dayZ-nightZ)*day;
+    zenith=zenith+(twiZ-zenith)*(twilight*0.42f);
+    const float vertical=apexClamp01(direction.y*0.5f+0.5f);
+    Ogre::Vector3 colour=horizon+(zenith-horizon)*std::pow(vertical,0.52f);
+    if(direction.y<0.0f) {
+        const Ogre::Vector3 groundNight(0.006f,0.010f,0.022f);
+        const Ogre::Vector3 groundDay(0.10f,0.13f,0.12f);
+        const Ogre::Vector3 groundTwilight(0.16f,0.075f,0.05f);
+        Ogre::Vector3 ground=groundNight+(groundDay-groundNight)*day;
+        ground=ground+(groundTwilight-ground)*(twilight*0.6f);
+        colour=colour+(ground-colour)*apexClamp01(-direction.y*5.5f);
+    }
+    const float sunDot=apexClamp01(direction.dotProduct(sunDirection));
+    const float lobePower=std::fmax(5.0f,96.0f/(1.0f+mipBlur*14.0f));
+    const float diskPower=std::fmax(3.0f,512.0f/(1.0f+mipBlur*10.0f));
+    colour+=Ogre::Vector3(1.0f,0.62f,0.34f)*
+        std::pow(sunDot,lobePower)*(0.16f+0.24f*twilight);
+    colour+=Ogre::Vector3(2.8f,2.3f,1.7f)*
+        std::pow(sunDot,diskPower)*(1.0f-mipBlur)*0.85f*
+        apexSmooth(-0.08f,0.02f,sunElev);
+    const Ogre::Vector3 average=(horizon+zenith)*0.5f;
+    colour=colour+(average-colour)*(mipBlur*0.32f);
+    return Ogre::Vector3(apexClamp01(colour.x),apexClamp01(colour.y),apexClamp01(colour.z));
+}
+static void updateApexEnvironmentCubemap(OgreContext* ctx,
+                                         float sunX,float sunZ,float sunElev,
+                                         const Ogre::ColourValue& fogColour) {
+    if(!ctx || !ctx->environmentCubemap) return;
+    Ogre::Vector3 sunDir(sunX,sunElev,sunZ);
+    if(sunDir.squaredLength()<1.0e-5f) sunDir=Ogre::Vector3(0.2f,0.8f,-0.3f);
+    sunDir.normalise();
+    Ogre::TextureGpuManager* texMgr=
+        ctx->root->getRenderSystem()->getTextureGpuManager();
+    const uint32_t baseSize=128u;
+    const uint8_t mipLevels=8u;
+    for(uint8_t mip=0;mip<mipLevels;++mip) {
+        const uint32_t size=std::max<uint32_t>(1u,baseSize>>mip);
+        const float blur=(float)mip/(float)(mipLevels-1u);
+        Ogre::StagingTexture* staging=
+            texMgr->getStagingTexture(size,size,1u,6u,Ogre::PFG_RGBA8_UNORM_SRGB);
+        staging->startMapRegion();
+        Ogre::TextureBox box=staging->mapRegion(size,size,1u,6u,Ogre::PFG_RGBA8_UNORM_SRGB);
+        for(uint32_t face=0;face<6u;++face) {
+            for(uint32_t y=0;y<size;++y) {
+                uint8_t* row=(uint8_t*)box.at(0,y,face);
+                for(uint32_t x=0;x<size;++x) {
+                    const float u=((float)x+0.5f)/(float)size*2.0f-1.0f;
+                    const float v=1.0f-((float)y+0.5f)/(float)size*2.0f;
+                    const Ogre::Vector3 ray=apexCubeDirection(face,u,v);
+                    const Ogre::Vector3 c=apexSampleSkyIbl(ray,sunDir,sunElev,fogColour,blur);
+                    row[x*4u+0u]=apexLinearToSrgb(c.x);
+                    row[x*4u+1u]=apexLinearToSrgb(c.y);
+                    row[x*4u+2u]=apexLinearToSrgb(c.z);
+                    row[x*4u+3u]=255u;
+                }
+            }
+        }
+        staging->stopMapRegion();
+        staging->upload(box,ctx->environmentCubemap,mip,nullptr,nullptr,false);
+        texMgr->removeStagingTexture(staging);
+    }
+}
+static void createApexEnvironmentCubemap(OgreContext* ctx) {
+    if(!ctx || !ctx->root || ctx->environmentCubemap) return;
+    Ogre::TextureGpuManager* texMgr=
+        ctx->root->getRenderSystem()->getTextureGpuManager();
+    ctx->environmentCubemap=texMgr->createTexture(
+        "ApexSkyIblCubemap",Ogre::GpuPageOutStrategy::Discard,
+        Ogre::TextureFlags::ManualTexture,Ogre::TextureTypes::TypeCube);
+    ctx->environmentCubemap->setResolution(128u,128u,6u);
+    ctx->environmentCubemap->setNumMipmaps(8u);
+    ctx->environmentCubemap->setPixelFormat(Ogre::PFG_RGBA8_UNORM_SRGB);
+    ctx->environmentCubemap->scheduleTransitionTo(Ogre::GpuResidency::Resident);
+    updateApexEnvironmentCubemap(
+        ctx,0.25f,-0.30f,0.55f,Ogre::ColourValue(0.48f,0.68f,0.94f,1.0f));
 }
 static void rebuildApexSky(OgreContext* ctx, float sunElev,
                            const Ogre::ColourValue& fogColour) {
@@ -469,6 +585,7 @@ ctx->uiNode->attachObject(ctx->uiManual);
 Ogre::CompositorManager2* compMgr = ctx->root->getCompositorManager2();
 const Ogre::String wsName = "ApexBasicWS";
 createApexAtmosphereSky(ctx);
+createApexEnvironmentCubemap(ctx);
 createApexPssmShadowNode(ctx, compMgr);
 Ogre::HlmsPbs* pbsForShadows = static_cast<Ogre::HlmsPbs*>(
     ctx->root->getHlmsManager()->getHlms(Ogre::HLMS_PBS));
@@ -611,6 +728,8 @@ std::string dbName = "ApexPBS_" + std::to_string(key);
 Ogre::HlmsPbsDatablock* db = (Ogre::HlmsPbsDatablock*)hlmsPbs->createDatablock(
 dbName, dbName, macro, blend, Ogre::HlmsParamVec());
 db->setReceiveShadows(true);
+if (ctx->environmentCubemap)
+    db->setTexture(Ogre::PBSM_REFLECTION, ctx->environmentCubemap);
 if (water) {
     db->setWorkflow(Ogre::HlmsPbsDatablock::MetallicWorkflow);
     db->setDiffuse(Ogre::Vector3(tr * 0.78f, tg * 0.92f, tb));
@@ -802,6 +921,7 @@ if(std::fmax(fog_r,std::fmax(fog_g,fog_b))>0.002f)
 else
     ctx->sceneMgr->setFog(Ogre::FOG_NONE);
 rebuildApexSky(ctx,sun_elev,fogColour);
+updateApexEnvironmentCubemap(ctx,sun_x,sun_z,sun_elev,fogColour);
 }
 // ---------------------------------------------------------------------------
 // UI (2D)
