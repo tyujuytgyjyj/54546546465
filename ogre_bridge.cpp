@@ -90,6 +90,7 @@ struct OgreContext {
     Ogre::Light* sunLight = nullptr;
     Ogre::Light* skyRimLight = nullptr;
     Ogre::TextureGpu* environmentCubemap = nullptr;
+    std::chrono::steady_clock::time_point lastIblUpdate{};
     Ogre::ManualObject* skyManual = nullptr;
     Ogre::SceneNode* skyNode = nullptr;
     const std::string skyDbName = "ApexAtmosphereSky";
@@ -198,6 +199,10 @@ static void updateApexEnvironmentCubemap(OgreContext* ctx,
                                          float sunX,float sunZ,float sunElev,
                                          const Ogre::ColourValue& fogColour) {
     if(!ctx || !ctx->environmentCubemap) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (ctx->lastIblUpdate.time_since_epoch().count() != 0 &&
+        now - ctx->lastIblUpdate < std::chrono::milliseconds(250)) return;
+    ctx->lastIblUpdate = now;
     Ogre::Vector3 sunDir(sunX,sunElev,sunZ);
     if(sunDir.squaredLength()<1.0e-5f) sunDir=Ogre::Vector3(0.2f,0.8f,-0.3f);
     sunDir.normalise();
