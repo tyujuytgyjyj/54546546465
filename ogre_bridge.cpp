@@ -212,7 +212,7 @@ static void updateApexEnvironmentCubemap(OgreContext* ctx,
         Ogre::TextureBox box=staging->mapRegion(size,size,1u,6u,Ogre::PFG_RGBA8_UNORM_SRGB);
         for(uint32_t face=0;face<6u;++face) {
             for(uint32_t y=0;y<size;++y) {
-                uint8_t* row=(uint8_t*)box.at(0,y,face);
+                uint8_t* row=(uint8_t*)box.data + (size_t)face*box.bytesPerImage + (size_t)y*box.bytesPerRow;
                 for(uint32_t x=0;x<size;++x) {
                     const float u=((float)x+0.5f)/(float)size*2.0f-1.0f;
                     const float v=1.0f-((float)y+0.5f)/(float)size*2.0f;
