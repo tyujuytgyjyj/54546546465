@@ -109,10 +109,13 @@ struct OgreContext {
 
 static OgreContext* g_active_ctx = nullptr;
 
-// Keep explicit scene ordering: background/sky, opaque world, transparent water/glass, UI.
-static constexpr uint8_t kSkyRenderQueueGroup = Ogre::RENDER_QUEUE_SKIES_EARLY;
-static constexpr uint8_t kWorldRenderQueueGroup = Ogre::RENDER_QUEUE_MAIN;
-static constexpr uint8_t kUiRenderQueueGroup = Ogre::RENDER_QUEUE_OVERLAY;
+// OGRE-Next 3.x uses numeric queue IDs (the legacy RENDER_QUEUE_* enum is absent).
+// ManualObject2 is a v2 object: keep every queue in 0..99 (FAST mode).
+// Draw order: sky -> opaque world -> transparent water/glass -> UI.
+static constexpr uint8_t kSkyRenderQueueGroup = 5;
+static constexpr uint8_t kWorldRenderQueueGroup = 50;
+static constexpr uint8_t kTransparentRenderQueueGroup = 95;
+static constexpr uint8_t kUiRenderQueueGroup = 99;
 
 // ---------------------------------------------------------------------------
 // WndProc hook
@@ -613,9 +616,8 @@ cm.pool_db_names[idx] = dbName;
 Ogre::ManualObject* mo   = cm.pool_objs[idx];
 Ogre::SceneNode*    node = cm.pool_nodes[idx];
 // Transparent meshes must be rendered after opaque world geometry but before UI.
-// Keeping them in queue 0 makes water/glass order depend on opaque material sorting.
 const bool is_transparent = cm.is_water || is_glass || cm.is_glass;
-mo->setRenderQueueGroup(is_transparent ? Ogre::RENDER_QUEUE_TRANSPARENTS : kWorldRenderQueueGroup);
+mo->setRenderQueueGroup(is_transparent ? kTransparentRenderQueueGroup : kWorldRenderQueueGroup);
 mo->setCastShadows(!is_transparent);
 mo->setVisible(true);
 if (cm.is_water) {
