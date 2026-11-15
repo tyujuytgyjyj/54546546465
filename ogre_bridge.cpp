@@ -658,15 +658,25 @@ if (cm.is_water) {
         dst = src;
         const float x = src.px;
         const float z = src.pz;
-        const float a = x * 0.19f + z * 0.13f + waveTime * 0.74f;
-        const float b = x * -0.11f + z * 0.23f - waveTime * 0.96f;
-        const float d = x * 0.34f - z * 0.29f + waveTime * 1.31f;
-        const float ca = std::cos(a), cb = std::cos(b), cd = std::cos(d);
-        dst.py += 0.052f * std::sin(a) + 0.022f * std::sin(b) + 0.010f * std::sin(d);
-        Ogre::Vector3 localNormal(
-            -(0.052f * 0.19f * ca - 0.022f * 0.11f * cb + 0.010f * 0.34f * cd),
-            1.0f,
-            -(0.052f * 0.13f * ca + 0.022f * 0.23f * cb - 0.010f * 0.29f * cd));
+        // Port of the original water.frag wave field: several crossing wave
+        // directions plus small drifting ripples. Frequencies stay below the
+        // water mesh's vertex sampling limit to avoid striped/aliased reflections.
+        const float a = (x * 0.60f + z * 0.80f) * 0.55f + waveTime * 1.30f;
+        const float b = (x * -0.80f + z * 0.50f) * 0.90f + waveTime * 1.90f;
+        const float c = (x * 0.30f - z * 0.95f) * 1.25f + waveTime * 2.60f;
+        const float d = (x * 0.91f + z * 0.41f) * 0.42f - waveTime * 0.83f;
+        const float ca = std::cos(a), cb = std::cos(b), cc = std::cos(c), cd = std::cos(d);
+        const float waveX = 0.030f * 0.55f * 0.60f * ca
+                          + 0.020f * 0.90f * -0.80f * cb
+                          + 0.012f * 1.25f * 0.30f * cc
+                          + 0.010f * 0.42f * 0.91f * cd;
+        const float waveZ = 0.030f * 0.55f * 0.80f * ca
+                          + 0.020f * 0.90f * 0.50f * cb
+                          - 0.012f * 1.25f * 0.95f * cc
+                          + 0.010f * 0.42f * 0.41f * cd;
+        dst.py += 0.030f * std::sin(a) + 0.016f * std::sin(b)
+                + 0.007f * std::sin(c) + 0.004f * std::sin(d);
+        Ogre::Vector3 localNormal(-waveX, 1.0f, -waveZ);
         localNormal.normalise();
         dst.nx = localNormal.x; dst.ny = localNormal.y; dst.nz = localNormal.z;
 
@@ -692,7 +702,10 @@ if (cm.is_water) {
             0.034f + sourceColour.y * 0.075f,
             0.050f + sourceColour.z * 0.095f);
         const float fresnel = 0.02f + 0.98f * std::pow(1.0f - ndv, 5.0f);
-        const float reflectionWeight = 0.34f + 0.62f * fresnel;
+        // Dielectric water reflects little at head-on angles and almost
+        // everything at grazing angles, matching the Fresnel response of the
+        // original water shader instead of tinting the whole sea with the sky.
+        const float reflectionWeight = 0.08f + 0.90f * fresnel;
         Ogre::Vector3 waterColour =
             deepWater * (1.0f - reflectionWeight) +
             reflectedSky * (reflectionWeight * 0.88f);
@@ -710,8 +723,17 @@ if (cm.is_water) {
             x * 0.73f + z * 0.41f + waveTime * 1.7f);
         waterColour += Ogre::Vector3(1.0f, 0.78f, 0.53f) *
                        (sunGlint * 1.15f + solarDisc * 0.72f);
+        const float microRipple = 0.5f + 0.5f * std::sin(
+            x * 1.13f + z * 0.77f + waveTime * 2.35f);
         waterColour += Ogre::Vector3(0.010f, 0.024f, 0.030f) *
-                       (ripple * (0.15f + fresnel * 0.35f));
+                       (ripple * (0.12f + fresnel * 0.30f));
+        waterColour += Ogre::Vector3(0.004f, 0.012f, 0.016f) *
+                       (microRipple * (0.12f + fresnel * 0.18f));
+        // Alpha is used as a shoreline marker by plane_cells; output remains
+        // opaque so actual land is never washed out by transparent water.
+        const float shoreFoam = skyClamp01((242.0f - static_cast<float>(src.a)) / 52.0f);
+        waterColour = skyMix(waterColour, Ogre::Vector3(0.72f, 0.84f, 0.91f),
+                             shoreFoam * 0.46f);
 
         dst.r = static_cast<uint8_t>(skyClamp01(waterColour.x) * 255.0f);
         dst.g = static_cast<uint8_t>(skyClamp01(waterColour.y) * 255.0f);
@@ -836,8 +858,17 @@ static Ogre::Vector3 skyMix(const Ogre::Vector3& a, const Ogre::Vector3& b, floa
     return a * (1.0f - t) + b * t;
 }
 static float skyHash2(float x, float y) {
-    const float h = std::sin(x * 127.1f + y * 311.7f) * 43758.5453f;
-    return h - std::floor(h);
+    // Integer hash avoids a costly sin() for every lattice corner while keeping
+    // smooth value-noise interpolation in skyNoise2.
+    const uint32_t ix = static_cast<uint32_t>(static_cast<int32_t>(std::floor(x)));
+    const uint32_t iy = static_cast<uint32_t>(static_cast<int32_t>(std::floor(y)));
+    uint32_t h = ix * 0x8da6b343u ^ iy * 0xd8163841u;
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    h *= 0x846ca68bu;
+    h ^= h >> 16;
+    return static_cast<float>(h & 0x00ffffffu) * (1.0f / 16777215.0f);
 }
 static float skyNoise2(float x, float y) {
     const float ix = std::floor(x), iy = std::floor(y);
@@ -936,15 +967,22 @@ static Ogre::Vector3 skyColourForRay(const Ogre::Vector3& rayWorld,
         const float lowDistance = std::fmax((1050.0f - observerWorld.y) / projectedY, 0.0f);
         const float cloudX = observerWorld.x + ray.x * lowDistance + timeSeconds * 7.5f;
         const float cloudZ = observerWorld.z + ray.z * lowDistance - timeSeconds * 3.2f;
-        const float px = cloudX * 0.00115f;
-        const float pz = cloudZ * 0.00115f;
-        const float broad = skyFbm2(px, pz);
-        const float medium = skyFbm2(px * 2.7f + 11.2f, pz * 2.7f - 6.4f);
-        const float erosion = skyNoise2(px * 7.1f - 3.7f, pz * 7.1f + 8.1f);
-        const float billows = broad * 0.66f + medium * 0.25f + erosion * 0.09f;
-        const float shaped = billows + (erosion - 0.5f) * 0.055f;
-        cumulusDensity = skySmoothstep(0.555f, 0.685f, shaped);
-        cumulusShade = skyClamp01(0.34f + medium * 0.42f + erosion * 0.16f + sunVisible * 0.10f);
+        // Smaller, warped cloud volumes with a soft multi-scale edge. Domain
+        // warping breaks the old repeated square/strip silhouettes into rounded
+        // cumulus lobes without changing the day/sunrise/sunset colour curves.
+        const float px = cloudX * 0.00162f;
+        const float pz = cloudZ * 0.00162f;
+        const float warpX = (skyNoise2(px * 0.42f + 13.1f, pz * 0.42f - 4.7f) - 0.5f) * 0.52f;
+        const float warpZ = (skyNoise2(px * 0.42f - 7.3f, pz * 0.42f + 17.9f) - 0.5f) * 0.52f;
+        const float wx = px + warpX;
+        const float wz = pz + warpZ;
+        const float broad = skyFbm2(wx * 0.96f, wz * 0.96f);
+        const float medium = skyFbm2(wx * 2.25f + 11.2f, wz * 2.25f - 6.4f);
+        const float erosion = skyNoise2(wx * 5.4f - 3.7f, wz * 5.4f + 8.1f);
+        const float billows = broad * 0.63f + medium * 0.29f + erosion * 0.08f;
+        const float shaped = billows + (erosion - 0.5f) * 0.035f;
+        cumulusDensity = skySmoothstep(0.515f, 0.675f, shaped);
+        cumulusShade = skyClamp01(0.30f + medium * 0.46f + erosion * 0.14f + sunVisible * 0.10f);
 
         // A separate stretched high layer creates wispy cirrus streaks.
         const float highDistance = std::fmax((2650.0f - observerWorld.y) / projectedY, 0.0f);
@@ -1048,11 +1086,13 @@ static Ogre::Vector3 waterReflectionColour(const Ogre::Vector3& rayWorld,
         const float distance = std::fmax((1050.0f - observerWorld.y) / projY, 0.0f);
         const float cloudX = observerWorld.x + ray.x * distance + timeSeconds * 7.5f;
         const float cloudZ = observerWorld.z + ray.z * distance - timeSeconds * 3.2f;
-        const float px = cloudX * 0.00115f;
-        const float pz = cloudZ * 0.00115f;
+        const float px = cloudX * 0.00162f;
+        const float pz = cloudZ * 0.00162f;
         const float broad = skyNoise2(px, pz);
-        const float detail = skyNoise2(px * 2.7f + 11.2f, pz * 2.7f - 6.4f);
-        const float density = skySmoothstep(0.555f, 0.685f, broad * 0.76f + detail * 0.24f);
+        const float detail = skyNoise2(px * 2.65f + 11.2f, pz * 2.65f - 6.4f);
+        // Wider transition keeps reflected clouds smooth on the water mesh's
+        // per-vertex colour path instead of producing hard pixel-like patches.
+        const float density = skySmoothstep(0.505f, 0.715f, broad * 0.72f + detail * 0.28f);
         const Ogre::Vector3 topDay(1.18f, 1.20f, 1.18f);
         const Ogre::Vector3 bottomDay(0.40f, 0.49f, 0.62f);
         const Ogre::Vector3 topTwilight(1.48f, 0.66f, 0.31f);
@@ -1090,8 +1130,8 @@ static void updateSkyGradient(OgreContext* ctx, float sw, float sh) {
     const Ogre::Quaternion cameraOrientation = ctx->camNode->getOrientation();
     const float timeSeconds = static_cast<float>(GetTickCount64()) * 0.001f;
 
-    constexpr int cols = 128;
-    constexpr int rows = 72;
+    constexpr int cols = 256;
+    constexpr int rows = 144;
     ctx->skyManual->clear();
     ctx->skyManual->setRenderQueueGroup(kSkyRenderQueueGroup);
     ctx->skyManual->setLocalAabb(Ogre::Aabb::BOX_INFINITE);
