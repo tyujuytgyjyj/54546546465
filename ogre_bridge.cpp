@@ -1050,7 +1050,7 @@ static Ogre::Vector3 waterReflectionColour(const Ogre::Vector3& rayWorld,
         const float cloudZ = observerWorld.z + ray.z * distance - timeSeconds * 3.2f;
         const float px = cloudX * 0.00115f;
         const float pz = cloudZ * 0.00115f;
-        const float broad = skyFbm2(px, pz);
+        const float broad = skyNoise2(px, pz);
         const float detail = skyNoise2(px * 2.7f + 11.2f, pz * 2.7f - 6.4f);
         const float density = skySmoothstep(0.555f, 0.685f, broad * 0.76f + detail * 0.24f);
         const Ogre::Vector3 topDay(1.18f, 1.20f, 1.18f);
