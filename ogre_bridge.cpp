@@ -634,7 +634,7 @@ Ogre::HlmsPbs* pbsForShadows = static_cast<Ogre::HlmsPbs*>(
     ctx->root->getHlmsManager()->getHlms(Ogre::HLMS_PBS));
 if (pbsForShadows) pbsForShadows->setShadowSettings(Ogre::HlmsPbs::PCF_3x3);
 
-const bool windowHasMsaa = ctx->window->getSampleDescription().isMultisample();
+const bool windowHasMsaa = ctx->window->isMultisample();
 const Ogre::String hdrWorkspaceName = windowHasMsaa ? "HdrWorkspaceMsaa" : "HdrWorkspace";
 const bool hdrWorkspaceAvailable = compMgr->hasWorkspaceDefinition(hdrWorkspaceName);
 if (hdrWorkspaceAvailable) {
