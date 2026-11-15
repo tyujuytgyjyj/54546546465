@@ -491,6 +491,23 @@ db->setWorkflow(Ogre::HlmsPbsDatablock::MetallicWorkflow);
 db->setDiffuse(Ogre::Vector3(tr, tg, tb));
 db->setMetalness(0.92f);
 db->setRoughness(0.10f);
+} else if (spec >= 2.95f && spec < 3.45f) {
+ // Carbon-fibre interior: dielectric composite with a restrained clear coat.
+ // The loader encodes carbon materials as spec = 3.2.
+ db->setWorkflow(Ogre::HlmsPbsDatablock::MetallicWorkflow);
+ db->setDiffuse(Ogre::Vector3(tr, tg, tb));
+ db->setMetalness(0.0f);
+ db->setRoughness(0.42f);
+ db->setClearCoat(0.24f);
+ db->setClearCoatRoughness(0.20f);
+} else if (spec >= 3.45f) {
+ // Alcantara / fabric interior: non-metallic and strongly diffuse.
+ // The loader encodes these materials as spec = 3.6.
+ db->setWorkflow(Ogre::HlmsPbsDatablock::MetallicWorkflow);
+ db->setDiffuse(Ogre::Vector3(tr, tg, tb));
+ db->setMetalness(0.0f);
+ db->setRoughness(0.88f);
+ db->setClearCoat(0.0f);
 } else {
 // أسفلت ومبانٍ وأعشاب وأشجار
 db->setWorkflow(Ogre::HlmsPbsDatablock::MetallicWorkflow);
