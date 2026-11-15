@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 
 #include "OgreAbiUtils.h"
 #include "OgreRoot.h"
@@ -31,6 +32,7 @@
 #include "OgreManualObject2.h"
 #include "Compositor/OgreCompositorManager2.h"
 #include "Compositor/OgreCompositorWorkspace.h"
+#include "Compositor/OgreCompositorShadowNode.h"
 #include "OgreHlmsManager.h"
 #include "OgreHlmsPbs.h"
 #include "OgreHlmsPbsDatablock.h"
@@ -58,6 +60,9 @@ struct CachedMesh {
     float avg_spec = 0.35f;
     float base_a = 1.0f;
     bool is_glass = false;
+    bool is_water = false;
+    std::vector<BridgeVertex3D> animated_water_verts;
+    std::chrono::steady_clock::time_point last_water_update{};
 
     std::vector<Ogre::ManualObject*> pool_objs;
     std::vector<Ogre::SceneNode*> pool_nodes;
@@ -82,6 +87,13 @@ struct OgreContext {
     Ogre::SceneNode* camNode = nullptr;
     Ogre::Light* sunLight = nullptr;
     Ogre::Light* skyRimLight = nullptr;
+    Ogre::ManualObject* skyManual = nullptr;
+    Ogre::SceneNode* skyNode = nullptr;
+    const std::string skyDbName = "ApexAtmosphereSky";
+    bool env_initialised = false;
+    float last_env_sun_x = 0.0f, last_env_sun_y = 0.0f, last_env_sun_z = 0.0f;
+    float last_env_fog_r = 0.0f, last_env_fog_g = 0.0f, last_env_fog_b = 0.0f;
+    float last_env_sun_elev = 0.0f;
 
     Ogre::ManualObject* uiManual = nullptr;
     Ogre::SceneNode* uiNode = nullptr;
@@ -102,6 +114,115 @@ struct OgreContext {
 };
 
 static OgreContext* g_active_ctx = nullptr;
+
+// ---------------------------------------------------------------------------
+// Ogre-native sky, PSSM shadows and water vertex animation.
+// ---------------------------------------------------------------------------
+static float apexClamp01(float v) { return std::fmin(1.0f, std::fmax(0.0f, v)); }
+static float apexSmooth(float a, float b, float x) {
+    const float t = apexClamp01((x - a) / (b - a));
+    return t * t * (3.0f - 2.0f * t);
+}
+static Ogre::ColourValue apexMixColour(const Ogre::ColourValue& a,
+                                        const Ogre::ColourValue& b, float t) {
+    return Ogre::ColourValue(a.r + (b.r-a.r)*t, a.g + (b.g-a.g)*t,
+                             a.b + (b.b-a.b)*t, 1.0f);
+}
+static void rebuildApexSky(OgreContext* ctx, float sunElev,
+                           const Ogre::ColourValue& fogColour) {
+    if (!ctx || !ctx->skyManual) return;
+    const float day = apexSmooth(-0.08f, 0.22f, sunElev);
+    const float twilight = apexClamp01(1.0f - std::fabs(sunElev) / 0.24f);
+    const Ogre::ColourValue nightHorizon(0.008f,0.016f,0.038f,1.0f);
+    const Ogre::ColourValue twilightHorizon(0.72f,0.23f,0.105f,1.0f);
+    const Ogre::ColourValue nightZenith(0.0015f,0.0035f,0.014f,1.0f);
+    const Ogre::ColourValue twilightZenith(0.025f,0.035f,0.105f,1.0f);
+    const Ogre::ColourValue dayZenith(0.025f,0.105f,0.34f,1.0f);
+    Ogre::ColourValue horizon = apexMixColour(nightHorizon, fogColour, day);
+    horizon = apexMixColour(horizon, twilightHorizon, twilight * 0.48f);
+    Ogre::ColourValue zenith = apexMixColour(nightZenith, dayZenith, day);
+    zenith = apexMixColour(zenith, twilightZenith, twilight * 0.42f);
+    const Ogre::ColourValue ground(0.018f,0.020f,0.024f,1.0f);
+    const unsigned int latSegments=18u, lonSegments=48u, row=lonSegments+1u;
+    const float radius=2100.0f, pi=Ogre::Math::PI;
+    ctx->skyManual->clear();
+    ctx->skyManual->begin(ctx->skyDbName, Ogre::OT_TRIANGLE_LIST);
+    for(unsigned int y=0;y<=latSegments;++y) {
+        const float latitude=-0.5f*pi + pi*(float)y/(float)latSegments;
+        const float cy=std::sin(latitude), ring=std::cos(latitude);
+        const float upper=apexSmooth(-0.04f,0.18f,cy);
+        Ogre::ColourValue colour=apexMixColour(ground,horizon,apexSmooth(-0.28f,-0.035f,cy));
+        colour=apexMixColour(colour,zenith,std::pow(apexClamp01(upper),0.72f));
+        for(unsigned int x=0;x<=lonSegments;++x) {
+            const float longitude=2.0f*pi*(float)x/(float)lonSegments;
+            ctx->skyManual->position(radius*ring*std::cos(longitude),radius*cy,
+                                     radius*ring*std::sin(longitude));
+            ctx->skyManual->colour(colour.r,colour.g,colour.b,1.0f);
+        }
+    }
+    for(unsigned int y=0;y<latSegments;++y) for(unsigned int x=0;x<lonSegments;++x) {
+        const unsigned int a=y*row+x,b=a+1u,c=a+row,d=c+1u;
+        ctx->skyManual->triangle(a,b,c); ctx->skyManual->triangle(b,d,c);
+    }
+    ctx->skyManual->end();
+    ctx->skyManual->setLocalAabb(Ogre::Aabb::BOX_INFINITE);
+}
+static void createApexAtmosphereSky(OgreContext* ctx) {
+    if(!ctx || !ctx->sceneMgr || !ctx->camNode || ctx->skyManual) return;
+    Ogre::HlmsUnlit* unlit=static_cast<Ogre::HlmsUnlit*>(
+        ctx->root->getHlmsManager()->getHlms(Ogre::HLMS_UNLIT));
+    Ogre::HlmsMacroblock macro;
+    macro.mDepthCheck=true; macro.mDepthWrite=false; macro.mCullMode=Ogre::CULL_NONE;
+    Ogre::HlmsBlendblock blend;
+    if(!unlit->getDatablock(ctx->skyDbName))
+        unlit->createDatablock(ctx->skyDbName,ctx->skyDbName,macro,blend,Ogre::HlmsParamVec());
+    ctx->skyManual=ctx->sceneMgr->createManualObject(Ogre::SCENE_DYNAMIC);
+    ctx->skyManual->setRenderQueueGroup(0);
+    ctx->skyManual->setCastShadows(false);
+    ctx->skyManual->setLocalAabb(Ogre::Aabb::BOX_INFINITE);
+    ctx->skyNode=ctx->camNode->createChildSceneNode(Ogre::SCENE_DYNAMIC);
+    ctx->skyNode->attachObject(ctx->skyManual);
+    rebuildApexSky(ctx,0.55f,Ogre::ColourValue(0.48f,0.68f,0.94f,1.0f));
+}
+static void createApexPssmShadowNode(OgreContext* ctx,Ogre::CompositorManager2* compMgr) {
+    const Ogre::String nodeName="ApexForzaPssmShadowNode";
+    if(!ctx || !compMgr || compMgr->hasShadowNodeDefinition(nodeName)) return;
+    Ogre::ShadowNodeHelper::ShadowParam shadow;
+    shadow.supportedLightTypes=1u<<Ogre::Light::LT_DIRECTIONAL;
+    shadow.technique=Ogre::SHADOWMAP_PSSM; shadow.numPssmSplits=3u; shadow.atlasId=0u;
+    for(size_t i=0;i<4u;++i) {
+        shadow.atlasStart[i]=Ogre::ShadowNodeHelper::Resolution(0u,0u);
+        shadow.resolution[i]=Ogre::ShadowNodeHelper::Resolution(0u,0u);
+    }
+    shadow.atlasStart[0]=Ogre::ShadowNodeHelper::Resolution(0u,0u);
+    shadow.resolution[0]=Ogre::ShadowNodeHelper::Resolution(2048u,2048u);
+    shadow.atlasStart[1]=Ogre::ShadowNodeHelper::Resolution(2048u,0u);
+    shadow.resolution[1]=Ogre::ShadowNodeHelper::Resolution(1024u,1024u);
+    shadow.atlasStart[2]=Ogre::ShadowNodeHelper::Resolution(3072u,0u);
+    shadow.resolution[2]=Ogre::ShadowNodeHelper::Resolution(1024u,1024u);
+    Ogre::ShadowNodeHelper::ShadowParamVec params; params.push_back(shadow);
+    Ogre::ShadowNodeHelper::createShadowNodeWithSettings(
+        compMgr,ctx->root->getRenderSystem()->getCapabilities(),nodeName,
+        params,false,1024u,0.95f,1.0f,0.125f,0.20f);
+}
+static void buildApexWaterWaves(const std::vector<BridgeVertex3D>& source,
+                                std::vector<BridgeVertex3D>& target,float timeSeconds) {
+    target=source;
+    for(BridgeVertex3D& v:target) {
+        const float x=v.px,z=v.pz;
+        const float p1=x*0.19f+z*0.13f+timeSeconds*0.78f;
+        const float p2=x*-0.33f+z*0.28f+timeSeconds*1.17f;
+        const float p3=x*0.61f-z*0.48f+timeSeconds*1.63f;
+        const float s1=std::sin(p1),c1=std::cos(p1);
+        const float s2=std::sin(p2),c2=std::cos(p2);
+        const float s3=std::sin(p3),c3=std::cos(p3);
+        v.py+=0.055f*s1+0.028f*s2+0.014f*s3;
+        const float dx=0.01045f*c1-0.00924f*c2+0.00854f*c3;
+        const float dz=0.00715f*c1+0.00784f*c2-0.00672f*c3;
+        const float inv=1.0f/std::sqrt(dx*dx+1.0f+dz*dz);
+        v.nx=-dx*inv; v.ny=inv; v.nz=-dz*inv;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // WndProc hook
@@ -321,6 +442,7 @@ ctx->sunLight->setDiffuseColour(1.0f, 0.94f, 0.84f);
 ctx->sunLight->setSpecularColour(1.0f, 0.96f, 0.90f);
 ctx->sunLight->setDirection(Ogre::Vector3(-0.5f, -0.8f, -0.3f).normalisedCopy());
 ctx->sunLight->setPowerScale(Ogre::Math::PI * 1.65f);
+ctx->sunLight->setCastShadows(true);
 // إضاءة الحواف (Rim / Sky Fill)
 ctx->skyRimLight = ctx->sceneMgr->createLight();
 Ogre::SceneNode* rimNode = ctx->sceneMgr->getRootSceneNode()->createChildSceneNode();
@@ -342,9 +464,15 @@ ctx->uiNode->attachObject(ctx->uiManual);
 // --- Workspace أساسي ---
 Ogre::CompositorManager2* compMgr = ctx->root->getCompositorManager2();
 const Ogre::String wsName = "ApexBasicWS";
+createApexAtmosphereSky(ctx);
+createApexPssmShadowNode(ctx, compMgr);
+Ogre::HlmsPbs* pbsForShadows = static_cast<Ogre::HlmsPbs*>(
+    ctx->root->getHlmsManager()->getHlms(Ogre::HLMS_PBS));
+if (pbsForShadows) pbsForShadows->setShadowSettings(Ogre::HlmsPbs::PCF_3x3);
 if (!compMgr->hasWorkspaceDefinition(wsName)) {
 compMgr->createBasicWorkspaceDef(
-wsName, Ogre::ColourValue(0.48f, 0.68f, 0.94f, 1.0f), Ogre::IdString());
+wsName, Ogre::ColourValue(0.48f, 0.68f, 0.94f, 1.0f),
+Ogre::IdString("ApexForzaPssmShadowNode"));
 }
 compMgr->addWorkspace(ctx->sceneMgr, ctx->window->getTexture(), ctx->camera, wsName, true);
 // --- نسيج أبيض افتراضي (id = 1) ---
@@ -388,7 +516,7 @@ BRIDGE_API uint32_t ogre_upload_mesh(
 void* raw_ctx,
 const BridgeVertex3D* verts, uint32_t vcount,
 const uint16_t* indices, uint32_t icount,
-uint32_t tex_id, bool is_glass)
+uint32_t tex_id, bool is_glass, bool is_water)
 {
 OgreContext* ctx = (OgreContext*)raw_ctx;
 if (!ctx || !verts || !indices || vcount == 0 || icount < 3) return 0;
@@ -398,6 +526,7 @@ cm.cpu_verts.assign(verts, verts + vcount);
 cm.cpu_indices.assign(indices, indices + icount);
 cm.tex_id   = (tex_id == 0) ? 1 : tex_id;
 cm.is_glass = is_glass;
+cm.is_water = is_water;
 cm.avg_spec = verts->spec;
 cm.base_a   = verts->a / 255.0f;
 ctx->meshes[id] = std::move(cm);
@@ -421,7 +550,7 @@ populateManualObject(cm.pool_objs[i], cm.pool_db_names[i], cm.cpu_verts, cm.cpu_
 }
 }
 
-BRIDGE_API void ogre_set_mesh_material(void* raw_ctx, uint32_t mesh_id, uint32_t tex_id, bool is_glass) {
+BRIDGE_API void ogre_set_mesh_material(void* raw_ctx, uint32_t mesh_id, uint32_t tex_id, bool is_glass, bool is_water) {
     if (!raw_ctx) return;
     OgreContext* ctx = (OgreContext*)raw_ctx;
     auto it = ctx->meshes.find(mesh_id);
@@ -429,6 +558,10 @@ BRIDGE_API void ogre_set_mesh_material(void* raw_ctx, uint32_t mesh_id, uint32_t
     CachedMesh& cm = it->second;
     cm.tex_id = tex_id == 0 ? 1 : tex_id;
     cm.is_glass = is_glass;
+    const bool waterChanged = cm.is_water != is_water;
+    cm.is_water = is_water;
+    if (waterChanged) for (Ogre::ManualObject* obj : cm.pool_objs)
+        obj->setCastShadows(!cm.is_glass && !cm.is_water);
 }
 
 // ---------------------------------------------------------------------------
@@ -437,7 +570,7 @@ BRIDGE_API void ogre_set_mesh_material(void* raw_ctx, uint32_t mesh_id, uint32_t
 static std::string getOrCreatePbsDatablockName(
 OgreContext* ctx, uint32_t tex_id,
 float tr, float tg, float tb,
-float spec, bool glass, float alpha)
+float spec, bool glass, float alpha, bool water)
 {
 uint32_t qr = (uint32_t)(tr * 63.0f) & 63;
 uint32_t qg = (uint32_t)(tg * 63.0f) & 63;
@@ -446,7 +579,7 @@ uint32_t qs = (uint32_t)((spec + 2.0f) * 20.0f) & 255;
 uint64_t key = ((uint64_t)tex_id << 32) |
 ((uint64_t)qr << 24) | ((uint64_t)qg << 18) |
 ((uint64_t)qb << 12) | ((uint64_t)qs << 2)  |
-(glass ? 1ULL : 0ULL);
+(glass ? 1ULL : 0ULL) | (water ? 2ULL : 0ULL);
 auto it = ctx->pbs_cache.find(key);
 if (it != ctx->pbs_cache.end()) return it->second;
 auto texIt = ctx->textures.find(tex_id == 0 ? 1 : tex_id);
@@ -456,6 +589,10 @@ Ogre::HlmsPbs* hlmsPbs =
 Ogre::HlmsMacroblock macro;
 Ogre::HlmsBlendblock blend;
 macro.mCullMode = Ogre::CULL_NONE;
+if (water || (glass && !is_cutout)) {
+macro.mDepthWrite = false;
+blend.setBlendType(Ogre::SBT_TRANSPARENT_ALPHA);
+}
 if (glass && !is_cutout) {
 macro.mDepthWrite = false;
 blend.setBlendType(Ogre::SBT_TRANSPARENT_ALPHA);
@@ -463,7 +600,17 @@ blend.setBlendType(Ogre::SBT_TRANSPARENT_ALPHA);
 std::string dbName = "ApexPBS_" + std::to_string(key);
 Ogre::HlmsPbsDatablock* db = (Ogre::HlmsPbsDatablock*)hlmsPbs->createDatablock(
 dbName, dbName, macro, blend, Ogre::HlmsParamVec());
-if (spec > 2.0f && spec < 2.5f) {
+db->setReceiveShadows(true);
+if (water) {
+    db->setWorkflow(Ogre::HlmsPbsDatablock::MetallicWorkflow);
+    db->setDiffuse(Ogre::Vector3(tr * 0.78f, tg * 0.92f, tb));
+    db->setMetalness(0.015f);
+    db->setRoughness(0.075f);
+    db->setClearCoat(1.0f);
+    db->setClearCoatRoughness(0.035f);
+    db->setSpecular(Ogre::Vector3(0.92f, 0.96f, 1.0f));
+    db->setTransparency(0.72f, Ogre::HlmsPbsDatablock::Transparent);
+} else if (spec > 2.0f && spec < 2.5f) {
 // Automotive metallic base coat with Ogre PBS clear-coat layer.
 db->setWorkflow(Ogre::HlmsPbsDatablock::MetallicWorkflow);
 db->setDiffuse(Ogre::Vector3(tr * 0.92f, tg * 0.92f, tb * 0.92f));
@@ -549,12 +696,13 @@ if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pz) ||
 CachedMesh& cm = it->second;
 std::string dbName = getOrCreatePbsDatablockName(
 ctx, cm.tex_id, tint_r, tint_g, tint_b,
-cm.avg_spec, is_glass || cm.is_glass, cm.base_a);
+cm.avg_spec, is_glass || cm.is_glass, cm.base_a, cm.is_water);
 size_t idx = cm.used_this_frame++;
 if (idx >= cm.pool_objs.size()) {
 Ogre::ManualObject* newObj = ctx->sceneMgr->createManualObject(Ogre::SCENE_DYNAMIC);
 newObj->setRenderQueueGroup(0);
-populateManualObject(newObj, dbName, cm.cpu_verts, cm.cpu_indices);
+newObj->setCastShadows(!cm.is_glass && !is_glass && !cm.is_water);
+if (!cm.is_water) populateManualObject(newObj, dbName, cm.cpu_verts, cm.cpu_indices);
 Ogre::SceneNode* newNode = ctx->sceneMgr->getRootSceneNode(Ogre::SCENE_DYNAMIC)
 ->createChildSceneNode(Ogre::SCENE_DYNAMIC);
 newNode->attachObject(newObj);
@@ -567,6 +715,16 @@ cm.pool_db_names[idx] = dbName;
 }
 Ogre::ManualObject* mo   = cm.pool_objs[idx];
 Ogre::SceneNode*    node = cm.pool_nodes[idx];
+if (cm.is_water) {
+    const auto now = std::chrono::steady_clock::now();
+    if (cm.animated_water_verts.empty() || now - cm.last_water_update >= std::chrono::milliseconds(100)) {
+        static const auto waterEpoch = std::chrono::steady_clock::now();
+        const float waterTime = std::chrono::duration<float>(now - waterEpoch).count();
+        buildApexWaterWaves(cm.cpu_verts, cm.animated_water_verts, waterTime);
+        populateManualObject(mo, dbName, cm.animated_water_verts, cm.cpu_indices);
+        cm.last_water_update = now;
+    }
+}
 mo->setVisible(true);
 node->setPosition(Ogre::Vector3(px, py, pz));
 node->setOrientation(Ogre::Quaternion(qw, qx, qy, qz));  // ترتيب Ogre: w,x,y,z
@@ -592,19 +750,46 @@ BRIDGE_API void ogre_set_env(void* raw_ctx,
 float sun_x, float sun_y, float sun_z,
 float fog_r, float fog_g, float fog_b,
 float sun_elev) {
+if (!raw_ctx) return;
 OgreContext* ctx = (OgreContext*)raw_ctx;
-Ogre::Vector3 dir(-sun_x, -sun_y, -sun_z);
-if (dir.squaredLength() < 1e-4f) dir = Ogre::Vector3(-0.4f, -0.8f, -0.3f);
+auto safe01 = [](float v) -> float {
+    return std::isfinite(v) ? std::fmin(1.0f, std::fmax(0.0f, v)) : 0.0f;
+};
+sun_x = std::isfinite(sun_x) ? sun_x : 0.0f;
+sun_y = std::isfinite(sun_y) ? sun_y : -1.0f;
+sun_z = std::isfinite(sun_z) ? sun_z : 0.0f;
+sun_elev = std::isfinite(sun_elev) ? std::fmax(-1.0f, std::fmin(1.0f, sun_elev)) : 0.0f;
+fog_r=safe01(fog_r); fog_g=safe01(fog_g); fog_b=safe01(fog_b);
+const float delta = std::fabs(sun_x-ctx->last_env_sun_x) +
+    std::fabs(sun_y-ctx->last_env_sun_y) + std::fabs(sun_z-ctx->last_env_sun_z) +
+    std::fabs(fog_r-ctx->last_env_fog_r) + std::fabs(fog_g-ctx->last_env_fog_g) +
+    std::fabs(fog_b-ctx->last_env_fog_b) + std::fabs(sun_elev-ctx->last_env_sun_elev);
+if (ctx->env_initialised && delta < 0.0015f) return;
+ctx->env_initialised=true;
+ctx->last_env_sun_x=sun_x; ctx->last_env_sun_y=sun_y; ctx->last_env_sun_z=sun_z;
+ctx->last_env_fog_r=fog_r; ctx->last_env_fog_g=fog_g; ctx->last_env_fog_b=fog_b;
+ctx->last_env_sun_elev=sun_elev;
+Ogre::Vector3 dir(-sun_x,-sun_y,-sun_z);
+if(dir.squaredLength()<1e-4f) dir=Ogre::Vector3(-0.4f,-0.8f,-0.3f);
 dir.normalise();
 ctx->sunLight->setDirection(dir);
-ctx->skyRimLight->setDirection(Ogre::Vector3(-dir.x, -0.35f, -dir.z).normalisedCopy());
-float day = std::fmin(1.0f, std::fmax(0.0f, (sun_elev + 0.12f) / 0.42f));
-float twilight = std::fmax(0.0f, 1.0f - std::fabs(sun_elev) / 0.22f);
-ctx->sunLight->setPowerScale(Ogre::Math::PI * (0.015f + 1.55f * day + 0.20f * twilight));
-ctx->skyRimLight->setPowerScale(Ogre::Math::PI * (0.06f + 0.22f * day + 0.08f * twilight));
-const Ogre::ColourValue ambientTop(0.012f + 0.30f * day + 0.06f * twilight, 0.018f + 0.34f * day + 0.035f * twilight, 0.045f + 0.42f * day);
-const Ogre::ColourValue ambientBottom(0.006f + 0.12f * day, 0.009f + 0.13f * day, 0.020f + 0.16f * day);
-ctx->sceneMgr->setAmbientLight(ambientTop, ambientBottom, Ogre::Vector3::UNIT_Y);
+ctx->skyRimLight->setDirection(Ogre::Vector3(-dir.x,-0.35f,-dir.z).normalisedCopy());
+const float day=std::fmin(1.0f,std::fmax(0.0f,(sun_elev+0.12f)/0.42f));
+const float twilight=std::fmax(0.0f,1.0f-std::fabs(sun_elev)/0.22f);
+ctx->sunLight->setPowerScale(Ogre::Math::PI*(0.015f+1.55f*day+0.20f*twilight));
+ctx->skyRimLight->setPowerScale(Ogre::Math::PI*(0.06f+0.22f*day+0.08f*twilight));
+const Ogre::ColourValue ambientTop(0.012f+0.30f*day+0.06f*twilight,
+    0.018f+0.34f*day+0.035f*twilight,0.045f+0.42f*day);
+const Ogre::ColourValue ambientBottom(0.006f+0.12f*day,
+    0.009f+0.13f*day,0.020f+0.16f*day);
+ctx->sceneMgr->setAmbientLight(ambientTop,ambientBottom,Ogre::Vector3::UNIT_Y);
+const Ogre::ColourValue fogColour(fog_r,fog_g,fog_b,1.0f);
+const float farDistance=std::fmax(100.0f,ctx->camera->getFarClipDistance());
+if(std::fmax(fog_r,std::fmax(fog_g,fog_b))>0.002f)
+    ctx->sceneMgr->setFog(Ogre::FOG_LINEAR,fogColour,0.001f,farDistance*0.18f,farDistance*0.92f);
+else
+    ctx->sceneMgr->setFog(Ogre::FOG_NONE);
+rebuildApexSky(ctx,sun_elev,fogColour);
 }
 // ---------------------------------------------------------------------------
 // UI (2D)
