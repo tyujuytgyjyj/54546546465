@@ -588,6 +588,8 @@ return dbName;
 // ---------------------------------------------------------------------------
 // Drawing 3D (TRS: موضع + دوران كواتيرنيون + مقياس)
 // ---------------------------------------------------------------------------
+static float skyClamp01(float x);
+static float skySmoothstep(float a, float b, float x);
 static Ogre::Vector3 skyColourForRay(const Ogre::Vector3& rayWorld,
                                      const Ogre::Vector3& sunDirWorld,
                                      float sunElevation,
@@ -853,7 +855,7 @@ static float skyFbm2(float x, float y) {
     float amplitude = 0.52f;
     float sum = 0.0f;
     float norm = 0.0f;
-    for (int octave = 0; octave < 5; ++octave) {
+    for (int octave = 0; octave < 3; ++octave) {
         sum += skyNoise2(x, y) * amplitude;
         norm += amplitude;
         x = x * 2.03f + 17.13f;
@@ -938,7 +940,7 @@ static Ogre::Vector3 skyColourForRay(const Ogre::Vector3& rayWorld,
         const float pz = cloudZ * 0.00115f;
         const float broad = skyFbm2(px, pz);
         const float medium = skyFbm2(px * 2.7f + 11.2f, pz * 2.7f - 6.4f);
-        const float erosion = skyFbm2(px * 7.1f - 3.7f, pz * 7.1f + 8.1f);
+        const float erosion = skyNoise2(px * 7.1f - 3.7f, pz * 7.1f + 8.1f);
         const float billows = broad * 0.66f + medium * 0.25f + erosion * 0.09f;
         const float shaped = billows + (erosion - 0.5f) * 0.055f;
         cumulusDensity = skySmoothstep(0.555f, 0.685f, shaped);
@@ -1006,8 +1008,8 @@ static void updateSkyGradient(OgreContext* ctx, float sw, float sh) {
     const Ogre::Quaternion cameraOrientation = ctx->camNode->getOrientation();
     const float timeSeconds = static_cast<float>(GetTickCount64()) * 0.001f;
 
-    constexpr int cols = 160;
-    constexpr int rows = 90;
+    constexpr int cols = 128;
+    constexpr int rows = 72;
     ctx->skyManual->clear();
     ctx->skyManual->setRenderQueueGroup(kSkyRenderQueueGroup);
     ctx->skyManual->setLocalAabb(Ogre::Aabb::BOX_INFINITE);
