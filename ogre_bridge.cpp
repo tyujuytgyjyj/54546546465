@@ -59,6 +59,8 @@ struct CachedMesh {
     float base_a = 1.0f;
     bool is_glass = false;
     bool is_water = false;
+    bool has_explicit_cutout = false;
+    bool has_wind_vertices = false;
     std::vector<BridgeVertex3D> animated_verts;
 
     std::vector<Ogre::ManualObject*> pool_objs;
@@ -216,6 +218,44 @@ static void registerHlms(Ogre::Root* root) {
 // ---------------------------------------------------------------------------
 // Textures  (قبل ogre_init لتفادي خطأ "identifier not found")
 // ---------------------------------------------------------------------------
+
+// CPU-generated mip chain for manually uploaded OGRE textures.
+static bool uploadRgbaMipChain(OgreContext* ctx,Ogre::TextureGpu* tex,const uint8_t* rgba,
+                               uint32_t width,uint32_t height,Ogre::PixelFormatGpu format) {
+    if(!ctx||!tex||!rgba||!width||!height)return false;
+    auto* tm=ctx->root->getRenderSystem()->getTextureGpuManager();
+    try {
+        tex->setNumMipmaps(0);
+        tex->scheduleTransitionTo(Ogre::GpuResidency::Resident);
+        uint32_t w=width,h=height,mip=0;
+        std::vector<uint8_t> level(rgba,rgba+static_cast<size_t>(w)*h*4u);
+        for(;;) {
+            auto* st=tm->getStagingTexture(w,h,1,1,format);
+            st->startMapRegion();
+            Ogre::TextureBox box=st->mapRegion(w,h,1,1,format);
+            for(uint32_t y=0;y<h;++y)
+                memcpy(static_cast<uint8_t*>(box.at(0,y,0)),level.data()+static_cast<size_t>(y)*w*4u,static_cast<size_t>(w)*4u);
+            st->stopMapRegion();
+            st->upload(box,tex,static_cast<uint8_t>(mip),nullptr,nullptr,false);
+            tm->removeStagingTexture(st);
+            if(w==1&&h==1)break;
+            uint32_t nw=std::max(1u,w/2u),nh=std::max(1u,h/2u);
+            std::vector<uint8_t> next(static_cast<size_t>(nw)*nh*4u);
+            for(uint32_t y=0;y<nh;++y)for(uint32_t x=0;x<nw;++x) {
+                uint32_t x0=std::min(w-1u,x*2u),x1=std::min(w-1u,x*2u+1u);
+                uint32_t y0=std::min(h-1u,y*2u),y1=std::min(h-1u,y*2u+1u);
+                size_t p0=(static_cast<size_t>(y0)*w+x0)*4u,p1=(static_cast<size_t>(y0)*w+x1)*4u;
+                size_t p2=(static_cast<size_t>(y1)*w+x0)*4u,p3=(static_cast<size_t>(y1)*w+x1)*4u;
+                size_t d=(static_cast<size_t>(y)*nw+x)*4u;
+                for(int c=0;c<4;++c)
+                    next[d+c]=static_cast<uint8_t>((static_cast<uint32_t>(level[p0+c])+level[p1+c]+level[p2+c]+level[p3+c]+2u)/4u);
+            }
+            level.swap(next); w=nw; h=nh; ++mip;
+        }
+        return true;
+    } catch(...) { return false; }
+}
+
 BRIDGE_API uint32_t ogre_create_texture(void* raw_ctx, uint32_t width, uint32_t height,
                                         const uint8_t* rgba, bool linear_filter) {
     if (!raw_ctx || width == 0 || height == 0 || width > 8192 || height > 8192) return 1;
@@ -223,17 +263,24 @@ OgreContext* ctx = (OgreContext*)raw_ctx;
 uint32_t id = ctx->next_tex_id++;
     std::string name = "ApexTex_" + std::to_string(id);
 
-    // فحص هل النسيج فيه أجزاء شفافة مقصوصة (أوراق الأشجار والعشب والأسوار)
+    // Dense regular sampling reliably detects small transparent fence holes.
     bool cutout = false;
     if (rgba && width > 4 && height > 4) {
-        size_t total = (size_t)width * height;
-        size_t step = std::max<size_t>(1, total / 512);
-        size_t zero_alpha = 0;
-        for (size_t i = 0; i < total; i += step) {
-            uint8_t a = rgba[i * 4 + 3];
-            if (a < 30) zero_alpha++;
+        const uint32_t sx=std::min(width,128u), sy=std::min(height,128u);
+        size_t transparent=0, opaque=0, intermediate=0;
+        const size_t samples=static_cast<size_t>(sx)*sy;
+        for(uint32_t gy=0;gy<sy;++gy) {
+            const uint32_t y=std::min(height-1u,(gy*height)/sy);
+            for(uint32_t gx=0;gx<sx;++gx) {
+                const uint32_t x=std::min(width-1u,(gx*width)/sx);
+                const uint8_t a=rgba[(static_cast<size_t>(y)*width+x)*4u+3u];
+                if(a<=16) ++transparent;
+                else if(a>=240) ++opaque;
+                else ++intermediate;
+            }
         }
-        if (zero_alpha > 3) cutout = true;
+        cutout=transparent>=std::max<size_t>(8,samples/400) &&
+               opaque>samples/5 && intermediate<samples*0.35;
     }
 
     Ogre::TextureGpuManager* texMgr = ctx->root->getRenderSystem()->getTextureGpuManager();
@@ -241,23 +288,12 @@ uint32_t id = ctx->next_tex_id++;
         name, Ogre::GpuPageOutStrategy::Discard,
         Ogre::TextureFlags::ManualTexture, Ogre::TextureTypes::Type2D);
 
-    tex->setResolution(width, height);
+    tex->setResolution(width,height);
     tex->setPixelFormat(Ogre::PFG_RGBA8_UNORM_SRGB);
-    tex->scheduleTransitionTo(Ogre::GpuResidency::Resident);
-
-    if (rgba) {
-        Ogre::StagingTexture* staging =
-            texMgr->getStagingTexture(width, height, 1, 1, Ogre::PFG_RGBA8_UNORM_SRGB);
-        staging->startMapRegion();
-        Ogre::TextureBox box = staging->mapRegion(width, height, 1, 1, Ogre::PFG_RGBA8_UNORM_SRGB);
-        for (uint32_t y = 0; y < height; ++y) {
-            memcpy((uint8_t*)box.at(0, y, 0),
-                   rgba + (size_t)y * width * 4,
-                   (size_t)width * 4);
-        }
-        staging->stopMapRegion();
-        staging->upload(box, tex, 0, nullptr, nullptr, false);
-        texMgr->removeStagingTexture(staging);
+    if(rgba) {
+        if(!uploadRgbaMipChain(ctx,tex,rgba,width,height,Ogre::PFG_RGBA8_UNORM_SRGB)) return 1;
+    } else {
+        tex->scheduleTransitionTo(Ogre::GpuResidency::Resident);
     }
 
     ctx->textures[id] = { tex, cutout, linear_filter };
@@ -377,11 +413,8 @@ static uint32_t createProceduralSurfaceNormal(OgreContext* ctx,const char* name,
     }}
     try{auto* tm=ctx->root->getRenderSystem()->getTextureGpuManager();
         auto* tex=tm->createTexture(name,Ogre::GpuPageOutStrategy::Discard,Ogre::TextureFlags::ManualTexture,Ogre::TextureTypes::Type2D);
-        tex->setResolution(w,h);tex->setPixelFormat(Ogre::PFG_RGBA8_UNORM);tex->scheduleTransitionTo(Ogre::GpuResidency::Resident);
-        auto* st=tm->getStagingTexture(w,h,1,1,Ogre::PFG_RGBA8_UNORM);st->startMapRegion();
-        Ogre::TextureBox box=st->mapRegion(w,h,1,1,Ogre::PFG_RGBA8_UNORM);
-        for(uint32_t y=0;y<h;++y)memcpy((uint8_t*)box.at(0,y,0),px.data()+(size_t)y*w*4u,(size_t)w*4u);
-        st->stopMapRegion();st->upload(box,tex,0,nullptr,nullptr,false);tm->removeStagingTexture(st);
+        tex->setResolution(w,h);tex->setPixelFormat(Ogre::PFG_RGBA8_UNORM);
+        if(!uploadRgbaMipChain(ctx,tex,px.data(),w,h,Ogre::PFG_RGBA8_UNORM)) return 0;
         uint32_t id=ctx->next_tex_id++;ctx->textures[id]={tex,false,true};return id;
     }catch(...){return 0;}
 }
@@ -458,11 +491,9 @@ static Ogre::TextureGpu* createProceduralCloudTexture(OgreContext* ctx,const cha
     try{
         auto* tm=ctx->root->getRenderSystem()->getTextureGpuManager();
         auto* tex=tm->createTexture(name,Ogre::GpuPageOutStrategy::Discard,Ogre::TextureFlags::ManualTexture,Ogre::TextureTypes::Type2D);
-        tex->setResolution(w,h);tex->setPixelFormat(Ogre::PFG_RGBA8_UNORM_SRGB);tex->scheduleTransitionTo(Ogre::GpuResidency::Resident);
-        auto* st=tm->getStagingTexture(w,h,1,1,Ogre::PFG_RGBA8_UNORM_SRGB);st->startMapRegion();
-        Ogre::TextureBox box=st->mapRegion(w,h,1,1,Ogre::PFG_RGBA8_UNORM_SRGB);
-        for(uint32_t y=0;y<h;++y)memcpy((uint8_t*)box.at(0,y,0),px.data()+(size_t)y*w*4u,(size_t)w*4u);
-        st->stopMapRegion();st->upload(box,tex,0,nullptr,nullptr,false);tm->removeStagingTexture(st);return tex;
+        tex->setResolution(w,h);tex->setPixelFormat(Ogre::PFG_RGBA8_UNORM_SRGB);
+        if(!uploadRgbaMipChain(ctx,tex,px.data(),w,h,Ogre::PFG_RGBA8_UNORM_SRGB)) return nullptr;
+        return tex;
     }catch(...){return nullptr;}
 }
 static void createSkyCloudPass(OgreContext* ctx,Ogre::HlmsUnlit* unlit){
@@ -545,21 +576,9 @@ static uint32_t createProceduralWaterNormal(OgreContext* ctx, const char* textur
         Ogre::TextureGpu* tex = texMgr->createTexture(
             textureName, Ogre::GpuPageOutStrategy::Discard,
             Ogre::TextureFlags::ManualTexture, Ogre::TextureTypes::Type2D);
-        tex->setResolution(width, height);
-        tex->setPixelFormat(Ogre::PFG_RGBA8_UNORM); // linear normal data
-        tex->scheduleTransitionTo(Ogre::GpuResidency::Resident);
-        Ogre::StagingTexture* staging =
-            texMgr->getStagingTexture(width, height, 1, 1, Ogre::PFG_RGBA8_UNORM);
-        staging->startMapRegion();
-        Ogre::TextureBox box =
-            staging->mapRegion(width, height, 1, 1, Ogre::PFG_RGBA8_UNORM);
-        for (uint32_t y = 0; y < height; ++y)
-            memcpy(static_cast<uint8_t*>(box.at(0,y,0)),
-                   pixels.data() + static_cast<size_t>(y) * width * 4u,
-                   static_cast<size_t>(width) * 4u);
-        staging->stopMapRegion();
-        staging->upload(box, tex, 0, nullptr, nullptr, false);
-        texMgr->removeStagingTexture(staging);
+        tex->setResolution(width,height);
+        tex->setPixelFormat(Ogre::PFG_RGBA8_UNORM);
+        if(!uploadRgbaMipChain(ctx,tex,pixels.data(),width,height,Ogre::PFG_RGBA8_UNORM)) return 0;
         const uint32_t id = ctx->next_tex_id++;
         ctx->textures[id] = { tex, false, true };
         return id;
@@ -655,7 +674,12 @@ BRIDGE_API void* ogre_init(const char* title, int width, int height, int msaa) {
     params["vsync_interval"] = "1";
     params["gamma"] = "true";
     params["FSAA"]  = msaa > 1 ? std::to_string(msaa) : "0";
-    ctx->window = ctx->root->createRenderWindow(title, width, height, false, &params);
+    try {
+        ctx->window=ctx->root->createRenderWindow(title,width,height,false,&params);
+    } catch(...) {
+        params["FSAA"]="0";
+        ctx->window=ctx->root->createRenderWindow(title,width,height,false,&params);
+    }
 
     ctx->window->getCustomAttribute("WINDOW", &ctx->hwnd);
     if (ctx->hwnd) {ctx->orig_wndproc =
@@ -830,7 +854,13 @@ cm.cpu_indices.assign(indices, indices + icount);
 cm.tex_id   = (tex_id == 0) ? 1 : tex_id;
 cm.is_glass = is_glass;
 cm.is_water = is_water;
-if (is_water) cm.animated_verts = cm.cpu_verts;
+cm.has_explicit_cutout = false;
+cm.has_wind_vertices = false;
+for(uint32_t i=0;i<vcount;++i){
+    cm.has_explicit_cutout = cm.has_explicit_cutout || (verts[i].spec>=16.0f && verts[i].spec<18.0f);
+    cm.has_wind_vertices = cm.has_wind_vertices || (verts[i].spec>=17.0f && verts[i].spec<18.0f);
+}
+if (is_water || cm.has_wind_vertices) cm.animated_verts = cm.cpu_verts;
 cm.avg_spec = verts->spec;
 cm.base_a   = verts->a / 255.0f;
 ctx->meshes[id] = std::move(cm);
@@ -848,7 +878,13 @@ if (it == ctx->meshes.end()) return;
 CachedMesh& cm = it->second;
 cm.cpu_verts.assign(verts, verts + vcount);
 cm.cpu_indices.assign(indices, indices + icount);
-if (cm.is_water) cm.animated_verts = cm.cpu_verts;
+cm.has_explicit_cutout = false;
+cm.has_wind_vertices = false;
+for(uint32_t i=0;i<vcount;++i){
+    cm.has_explicit_cutout = cm.has_explicit_cutout || (verts[i].spec>=16.0f && verts[i].spec<18.0f);
+    cm.has_wind_vertices = cm.has_wind_vertices || (verts[i].spec>=17.0f && verts[i].spec<18.0f);
+}
+if (cm.is_water || cm.has_wind_vertices) cm.animated_verts = cm.cpu_verts;
 cm.avg_spec = verts->spec;
 const bool addMeshTangents = cm.is_water || (cm.avg_spec >= 9.5f && cm.avg_spec <= 15.5f);
 for (size_t i = 0; i < cm.pool_objs.size(); ++i) {
@@ -873,18 +909,18 @@ BRIDGE_API void ogre_set_mesh_material(void* raw_ctx, uint32_t mesh_id, uint32_t
 static std::string getOrCreatePbsDatablockName(
 OgreContext* ctx, uint32_t tex_id,
 float tr, float tg, float tb,
-float spec, bool glass, bool water, float alpha)
+float spec, bool glass, bool water, float alpha, bool forceCutout)
 {
 uint32_t qr = (uint32_t)(tr * 63.0f) & 63;
 uint32_t qg = (uint32_t)(tg * 63.0f) & 63;
 uint32_t qb = (uint32_t)(tb * 63.0f) & 63;
 const uint32_t surfaceFamily = (spec >= 9.5f && spec <= 15.5f) ? static_cast<uint32_t>(std::max(1, std::min(6, static_cast<int>(std::lround(spec)) - 9))) : 0u;
 uint32_t qs = surfaceFamily ? 0u : ((uint32_t)((spec + 2.0f) * 20.0f) & 255u);
-uint64_t key = ((uint64_t)tex_id << 32) | ((uint64_t)qr << 26) | ((uint64_t)qg << 20) | ((uint64_t)qb << 14) | ((uint64_t)qs << 6) | ((uint64_t)surfaceFamily << 3) | (glass ? 2ULL : 0ULL) | (water ? 1ULL : 0ULL);
+uint64_t key = ((uint64_t)tex_id << 32) | ((uint64_t)qr << 26) | ((uint64_t)qg << 20) | ((uint64_t)qb << 14) | ((uint64_t)qs << 6) | ((uint64_t)surfaceFamily << 3) | (forceCutout ? 4ULL : 0ULL) | (glass ? 2ULL : 0ULL) | (water ? 1ULL : 0ULL);
 auto it = ctx->pbs_cache.find(key);
 if (it != ctx->pbs_cache.end()) return it->second;
 auto texIt = ctx->textures.find(tex_id == 0 ? 1 : tex_id);
-bool is_cutout = (texIt != ctx->textures.end()) ? texIt->second.has_cutout_alpha : false;
+bool is_cutout=forceCutout || ((texIt!=ctx->textures.end())?texIt->second.has_cutout_alpha:false);
 Ogre::HlmsPbs* hlmsPbs =
 (Ogre::HlmsPbs*)ctx->root->getHlmsManager()->getHlms(Ogre::HLMS_PBS);
 Ogre::HlmsMacroblock macro;
@@ -953,7 +989,7 @@ db->setRoughness(is_cutout ? 0.72f : 0.55f);
 // Alpha Test للعشب وأوراق الشجر
 if (is_cutout) {
 db->setAlphaTest(Ogre::CMPF_GREATER_EQUAL);
-db->setAlphaTestThreshold(0.35f);
+db->setAlphaTestThreshold(0.32f);
 }
 if (texIt != ctx->textures.end() && tex_id > 1) {
 db->setTexture(Ogre::PBSM_DIFFUSE, texIt->second.gpu,
@@ -962,6 +998,13 @@ db->setTexture(Ogre::PBSM_DIFFUSE, texIt->second.gpu,
 ctx->pbs_cache[key] = dbName;
 return dbName;
 }
+// A restrained coastal wind field shared by grass and ocean surface visuals.
+static void sampleCoastalWind(float timeSeconds,Ogre::Vector3& direction,float& gust){
+    const float angle=0.52f+0.18f*std::sin(timeSeconds*0.013f)+0.07f*std::sin(timeSeconds*0.031f+1.7f);
+    direction=Ogre::Vector3(std::cos(angle),0.0f,std::sin(angle)).normalisedCopy();
+    gust=0.62f+0.55f*std::fmax(0.0f,std::fmin(1.0f,0.78f+0.16f*std::sin(timeSeconds*0.071f+0.6f)+0.06f*std::sin(timeSeconds*0.19f+2.1f)));
+}
+
 // ---------------------------------------------------------------------------
 // Drawing 3D (TRS: موضع + دوران كواتيرنيون + مقياس)
 // ---------------------------------------------------------------------------
@@ -996,7 +1039,7 @@ std::string dbName = cm.is_water
     ? std::string("ApexWaterPbr")
     : getOrCreatePbsDatablockName(
         ctx, cm.tex_id, tint_r, tint_g, tint_b,
-        cm.avg_spec, is_glass || cm.is_glass, false, cm.base_a);
+        cm.avg_spec, is_glass || cm.is_glass, false, cm.base_a, cm.has_explicit_cutout);
 size_t idx = cm.used_this_frame++;
 if (idx >= cm.pool_objs.size()) {
 Ogre::ManualObject* newObj = ctx->sceneMgr->createManualObject(Ogre::SCENE_DYNAMIC);
@@ -1029,6 +1072,10 @@ if (cm.is_water) {
     const Ogre::Vector3 waterPosition(px, py, pz);
     const Ogre::Vector3 cameraPosition = ctx->camNode->getPosition();
     const Ogre::Vector3 sunDirection = ctx->skySunDir.normalisedCopy();
+    Ogre::Vector3 windDirection;
+    float windGust=1.0f;
+    sampleCoastalWind(waveTime,windDirection,windGust);
+    const Ogre::Vector3 crossWind(-windDirection.z,0.0f,windDirection.x);
     auto& waveVerts = cm.animated_verts;
     if (waveVerts.size() != cm.cpu_verts.size()) waveVerts.resize(cm.cpu_verts.size());
 
@@ -1053,9 +1100,10 @@ if (cm.is_water) {
         const float x = src.px, z = src.pz;
         Ogre::Vector3 displacement = Ogre::Vector3::ZERO;
         Ogre::Vector3 localNormal = Ogre::Vector3::UNIT_Y;
-        addGerstner(x,z, 0.88f, 0.47f,26.0f,0.070f,1.00f,0.42f,displacement,localNormal);
-        addGerstner(x,z,-0.36f, 0.93f,15.0f,0.040f,1.27f,0.32f,displacement,localNormal);
-        addGerstner(x,z, 0.14f,-0.99f, 8.5f,0.018f,1.72f,0.20f,displacement,localNormal);
+        addGerstner(x,z,windDirection.x,windDirection.z,28.0f,0.060f*windGust,0.92f+0.16f*windGust,0.44f,displacement,localNormal);
+        addGerstner(x,z,crossWind.x,crossWind.z,15.0f,0.030f*windGust,1.18f+0.12f*windGust,0.31f,displacement,localNormal);
+        const Ogre::Vector3 shortWind=(windDirection*0.82f+crossWind*0.57f).normalisedCopy();
+        addGerstner(x,z,shortWind.x,shortWind.z,8.5f,0.014f*windGust,1.62f+0.18f*windGust,0.20f,displacement,localNormal);
         localNormal.normalise();
         dst.px = src.px + displacement.x;
         dst.py = src.py + displacement.y;
@@ -1093,12 +1141,17 @@ if (cm.is_water) {
                                skySmoothstep(-0.10f,0.22f,ctx->skySunElevation);
         waterColour += Ogre::Vector3(1.0f,0.82f,0.63f) * (sunGlint*0.65f);
 
-        const float shoreSignal = skyClamp01((255.0f-static_cast<float>(src.a))/45.0f);
-        const float foamA = 0.5f+0.5f*std::sin(x*0.31f+z*0.19f+waveTime*0.82f);
-        const float foamB = 0.5f+0.5f*std::sin(x*0.17f-z*0.37f-waveTime*0.54f);
-        const float foamNoise = 0.55f*foamA+0.45f*foamB;
-        const float shoreFoam = skySmoothstep(0.02f,0.92f,shoreSignal)*(0.68f+0.32f*foamNoise);
-        waterColour = skyMix(waterColour,Ogre::Vector3(0.78f,0.90f,0.95f),shoreFoam*0.72f);
+        const float shoreSignal=skyClamp01((255.0f-static_cast<float>(src.a))/45.0f);
+        const float foamA=0.5f+0.5f*std::sin(x*0.31f+z*0.19f+waveTime*0.82f);
+        const float foamB=0.5f+0.5f*std::sin(x*0.17f-z*0.37f-waveTime*0.54f);
+        const float advectX=windDirection.x*waveTime*0.00042f;
+        const float advectZ=windDirection.z*waveTime*0.00042f;
+        const float foamLarge=surfaceNoise2(x*0.0016f-advectX,z*0.0016f-advectZ,48,48,907u);
+        const float foamFine=surfaceNoise2(x*0.0048f-advectX*2.1f,z*0.0048f-advectZ*2.1f,64,64,911u);
+        const float foamNoise=0.42f*foamA+0.18f*foamB+0.28f*foamLarge+0.12f*foamFine;
+        const float foamBreakup=skySmoothstep(0.34f,0.72f,foamNoise);
+        const float shoreFoam=skySmoothstep(0.02f,0.92f,shoreSignal)*foamBreakup*(0.58f+0.42f*windGust);
+        waterColour=skyMix(waterColour,Ogre::Vector3(0.82f,0.93f,0.97f),shoreFoam*0.76f);
 
         dst.r = static_cast<uint8_t>(skyClamp01(waterColour.x)*255.0f);
         dst.g = static_cast<uint8_t>(skyClamp01(waterColour.y)*255.0f);
@@ -1106,6 +1159,41 @@ if (cm.is_water) {
         dst.a = 255;
     }
     populateManualObject(mo, dbName, waveVerts, cm.cpu_indices, true);
+} else if(cm.has_wind_vertices) {
+    const float windTime=static_cast<float>(GetTickCount64())*0.001f;
+    Ogre::Vector3 windDirection;float windGust=1.0f;
+    sampleCoastalWind(windTime,windDirection,windGust);
+    auto& animated=cm.animated_verts;
+    if(animated.size()!=cm.cpu_verts.size())animated.resize(cm.cpu_verts.size());
+    for(size_t vi=0;vi<cm.cpu_verts.size();++vi){
+        const BridgeVertex3D& src=cm.cpu_verts[vi];BridgeVertex3D& dst=animated[vi];dst=src;
+        if(src.spec<17.0f || src.spec>=18.0f)continue;
+        const float height=skyClamp01((src.spec-17.0f)/0.9f);
+        const float phase=(src.px*windDirection.x+src.pz*windDirection.z)*0.062f+
+                          windTime*1.18f+0.28f*std::sin((src.px-src.pz)*0.021f);
+        const float sway=std::sin(phase)*0.18f*windGust*height*height;
+        dst.px+=windDirection.x*sway;dst.pz+=windDirection.z*sway;
+        Ogre::Vector3 n(-windDirection.x*0.16f*height,1.0f,-windDirection.z*0.16f*height);
+        n.normalise();dst.nx=n.x;dst.ny=n.y;dst.nz=n.z;
+    }
+    populateManualObject(mo,dbName,animated,cm.cpu_indices,false);
+} else if(cm.avg_spec>=14.5f && cm.avg_spec<=15.5f) {
+    const float windTime=static_cast<float>(GetTickCount64())*0.001f;
+    Ogre::Vector3 windDirection;float windGust=1.0f;
+    sampleCoastalWind(windTime,windDirection,windGust);
+    auto& grassVerts=cm.animated_verts;
+    if(grassVerts.size()!=cm.cpu_verts.size())grassVerts.resize(cm.cpu_verts.size());
+    for(size_t vi=0;vi<cm.cpu_verts.size();++vi){
+        const BridgeVertex3D& src=cm.cpu_verts[vi];BridgeVertex3D& dst=grassVerts[vi];dst=src;
+        const float h=skyClamp01(1.0f-src.v);
+        const float phase=(src.px*windDirection.x+src.pz*windDirection.z)*0.095f+
+                          windTime*1.72f+0.35f*std::sin((src.px-src.pz)*0.035f);
+        const float sway=std::sin(phase)*0.13f*windGust*h*h;
+        dst.px+=windDirection.x*sway;dst.pz+=windDirection.z*sway;
+        Ogre::Vector3 n(-windDirection.x*0.20f*h,1.0f,-windDirection.z*0.20f*h);
+        n.normalise();dst.nx=n.x;dst.ny=n.y;dst.nz=n.z;
+    }
+    populateManualObject(mo,dbName,grassVerts,cm.cpu_indices,false);
 }
 node->setPosition(Ogre::Vector3(px, py, pz));
 node->setOrientation(Ogre::Quaternion(qw, qx, qy, qz));  // ترتيب Ogre: w,x,y,z
@@ -1437,6 +1525,8 @@ static void updateSkyGradient(OgreContext* ctx, float sw, float sh) {
     const Ogre::Vector3 cameraWorld = ctx->camNode->getPosition();
     const Ogre::Quaternion cameraOrientation = ctx->camNode->getOrientation();
     const float timeSeconds = static_cast<float>(GetTickCount64()) * 0.001f;
+    const Ogre::Vector3 cameraForward=(cameraOrientation*Ogre::Vector3(0.0f,0.0f,-1.0f)).normalisedCopy();
+    const float skyCenterU=std::atan2(cameraForward.z,cameraForward.x)*0.1591549431f+0.5f;
 
     constexpr int cols = 256;
     constexpr int rows = 144;
@@ -1464,19 +1554,24 @@ static void updateSkyGradient(OgreContext* ctx, float sw, float sh) {
             const float horizonAlpha=skySmoothstep(-0.055f,0.025f,rayWorld.y);
             // Equirectangular direction mapping keeps cloud scale stable at the
             // horizon; the previous ground-plane projection caused radial streaks.
-            const float skyU=std::atan2(rayWorld.z,rayWorld.x)*0.1591549431f+0.5f;
+            float skyU=std::atan2(rayWorld.z,rayWorld.x)*0.1591549431f+0.5f;
+            // Unwrap longitude around the camera-centre ray. The previous
+            // 0/1 discontinuity made triangles interpolate through the atlas seam.
+            skyU += std::round(skyCenterU-skyU);
             const float skyV=std::asin(std::fmax(-1.0f,std::fmin(1.0f,rayWorld.y)))*0.3183098862f+0.5f;
+            const float zenithFade=1.0f-skySmoothstep(0.72f,0.965f,rayWorld.y);
+            const float cloudVisibility=horizonAlpha*zenithFade;
             if(ctx->skyCloudManual){
                 const Ogre::Vector3 tint=skyMix(cloudBottom,cloudTop,skySmoothstep(-0.02f,0.42f,rayWorld.y));
                 ctx->skyCloudManual->position(nx*halfW,ny*halfH,-d+0.0005f);
                 ctx->skyCloudManual->textureCoord(skyU+timeSeconds*0.000010f,skyV);
-                ctx->skyCloudManual->colour(tint.x,tint.y,tint.z,horizonAlpha*(0.94f+0.06f*cloudDay));
+                ctx->skyCloudManual->colour(tint.x,tint.y,tint.z,cloudVisibility*(0.94f+0.06f*cloudDay));
             }
             if(ctx->skyCirrusManual){
                 const Ogre::Vector3 tint=skyMix(cloudBottom*0.88f,cloudTop,skySmoothstep(-0.01f,0.48f,rayWorld.y));
                 ctx->skyCirrusManual->position(nx*halfW,ny*halfH,-d+0.0003f);
                 ctx->skyCirrusManual->textureCoord(skyU*0.72f+timeSeconds*0.000004f,skyV*1.85f);
-                ctx->skyCirrusManual->colour(tint.x,tint.y,tint.z,horizonAlpha*(0.12f+0.10f*cloudDay+0.035f*cloudNight));
+                ctx->skyCirrusManual->colour(tint.x,tint.y,tint.z,cloudVisibility*(0.12f+0.10f*cloudDay+0.035f*cloudNight));
             }
         }
     }

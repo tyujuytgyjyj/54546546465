@@ -1,9 +1,10 @@
-# APEX.drive Sky, Sand and Road Correction
+# APEX.drive Wind, Anti-Aliasing, Fence and Sky Fix
 
-- Cloud UVs now follow viewing direction on an equirectangular sky map. This removes the fixed-altitude projection responsible for radial streaks near the horizon.
-- 2K cumulus texture uses warped multi-scale billows, edge erosion and internal light/shadow variation. Cirrus is thinner and less opaque.
-- Sand no longer uses directional sine waves. It uses isotropic multi-scale grain with lower normal amplitude and reduced tiling.
-- Road asphalt also uses isotropic fine aggregate and a separate, subtle road-normal family.
-- Water rendering, vehicle grip, rolling resistance, suspension and sunrise/sunset curves are unchanged.
+- The camera-centred equirectangular cloud UV mapping is unwrapped to remove the 0/1 seam. Cloud masks fade near the zenith to avoid a pole discontinuity.
+- 4x MSAA is enabled by default; `--msaa8` requests 8x, while `--no-msaa` disables it. OGRE falls back to no MSAA if the requested mode cannot be created.
+- The bridge uploads a full CPU-generated mip chain for ordinary textures, cloud masks and normal maps.
+- Fence alpha is preserved as an explicit cutout material tag from `bake_props.py` through `props.rs`, with a dense runtime alpha-sampling fallback.
+- Trees, palms, shrubs and plants get height-weighted sway. Grass cards sway in the coastal wind; the same wind changes Gerstner wave direction/speed/strength and advects broken shoreline foam.
+- Water reflection rendering, tyre grip, rolling resistance, suspension and sunrise/sunset curves are retained.
 
-Source/archive structure was checked. A local Windows/MSVC OGRE build and in-game visual test are still required.
+The wind model is a lightweight visual field, not a full CFD solver or vehicle wind-force simulation. Source/archive structure has been checked; local MSVC/OGRE compilation and in-game visual tests remain required.
