@@ -140,8 +140,8 @@ static void openBridgeRuntimeLog() {
     const DWORD length = module ? GetModuleFileNameA(module, modulePath, MAX_PATH) : 0;
     if (length == 0 || length >= MAX_PATH) return;
     std::string dllPath(modulePath, length);
-    const size_t slash = dllPath.find_last_of("\\\\/");
-    const std::string directory = slash == std::string::npos ? ".\\\\" : dllPath.substr(0, slash + 1);
+    const size_t slash = dllPath.find_last_of("\\/");
+    const std::string directory = slash == std::string::npos ? ".\\" : dllPath.substr(0, slash + 1);
     g_bridgeRuntimeLog.open(directory + "ogre_bridge_runtime.log", std::ios::out | std::ios::trunc);
     if (g_bridgeRuntimeLog.is_open()) {
         bridgeRuntimeLog("APEX_BRIDGE_DIAGNOSTIC=2026-11-16-r1");

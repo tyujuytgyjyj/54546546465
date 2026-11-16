@@ -1,8 +1,8 @@
 use std::{env, fs, path::PathBuf};
 
 fn main() {
-    // This is the same import-library path used by the OGRE bridge CMake project.
-    let bridge_dir = PathBuf::from(r"C:\\OgreSDK\\ogre_bridge");
+    // The bridge import library and DLL are built by BUILD_BRIDGE.cmd.
+    let bridge_dir = PathBuf::from(r"C:\OgreSDK\ogre_bridge");
     let release_dir = bridge_dir.join("build").join("Release");
     let bridge_cpp = bridge_dir.join("ogre_bridge.cpp");
     let bridge_lib = release_dir.join("ogre_bridge.lib");
@@ -30,8 +30,8 @@ fn main() {
         panic!("ogre_bridge.dll is older than ogre_bridge.cpp. Run BUILD_BRIDGE.cmd, then rebuild the Rust client.");
     }
 
-    // Windows loads a linked DLL from the executable directory. rustc-link-search
-    // only finds the import library; it does not deploy the DLL at runtime.
+    // rustc-link-search finds the import library only; Windows also needs the DLL
+    // beside the executable. Copy it into the active Cargo profile directory.
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is missing"));
     let profile_dir = out_dir
         .ancestors()
