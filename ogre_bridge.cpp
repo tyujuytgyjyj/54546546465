@@ -267,7 +267,7 @@ uint32_t id = ctx->next_tex_id++;
     bool cutout = false;
     if (rgba && width > 4 && height > 4) {
         const uint32_t sx=std::min(width,128u), sy=std::min(height,128u);
-        size_t transparent=0, opaque=0, intermediate=0;
+        size_t transparent=0, opaque=0;
         const size_t samples=static_cast<size_t>(sx)*sy;
         for(uint32_t gy=0;gy<sy;++gy) {
             const uint32_t y=std::min(height-1u,(gy*height)/sy);
@@ -276,11 +276,12 @@ uint32_t id = ctx->next_tex_id++;
                 const uint8_t a=rgba[(static_cast<size_t>(y)*width+x)*4u+3u];
                 if(a<=16) ++transparent;
                 else if(a>=240) ++opaque;
-                else ++intermediate;
             }
         }
-        cutout=transparent>=std::max<size_t>(8,samples/400) &&
-               opaque>samples/5 && intermediate<samples*0.35;
+        // Antialiased grass blades may contain many intermediate alpha values.
+        // Fully transparent background plus opaque blade interiors is sufficient
+        // to identify cutout foliage; soft glass has no zero-alpha area.
+        cutout=transparent>=std::max<size_t>(8,samples/400) && opaque>samples/5;
     }
 
     Ogre::TextureGpuManager* texMgr = ctx->root->getRenderSystem()->getTextureGpuManager();
