@@ -354,7 +354,14 @@ static float surfaceHeight(float u,float v,int f){
     else if(f==2){h+=.030f*(surfaceNoise2(u,v,7,7,211)-.5f)+.022f*(surfaceNoise2(u,v,14,14,223)-.5f)+.014f*(surfaceNoise2(u,v,28,28,227)-.5f)+.009f*(surfaceNoise2(u,v,56,56,229)-.5f)+.005f*(surfaceNoise2(u,v,112,112,233)-.5f);}
     else if(f==3){h+=.030f*(surfaceNoise2(u,v,5,5,307)-.5f)+.018f*(surfaceNoise2(u,v,10,10,311)-.5f)+.012f*(surfaceNoise2(u,v,20,20,313)-.5f)+.008f*(surfaceNoise2(u,v,40,40,317)-.5f)+.004f*(surfaceNoise2(u,v,80,80,331)-.5f);}
     else if(f==4){h+=.014f*(surfaceNoise2(u,v,18,18,401)-.5f)+.010f*(surfaceNoise2(u,v,36,36,409)-.5f)+.008f*(surfaceNoise2(u,v,72,72,419)-.5f)+.005f*(surfaceNoise2(u,v,144,144,421)-.5f);}
-    else if(f==5){h+=.010f*std::sin(tau*(u*11+v*2));h+=.014f*(surfaceNoise2(u,v,20,20,503)-.5f)+.010f*(surfaceNoise2(u,v,40,40,509)-.5f)+.007f*(surfaceNoise2(u,v,80,80,521)-.5f)+.004f*(surfaceNoise2(u,v,160,160,523)-.5f);}
+    else if(f==5){
+        // Asphalt/road: fine isotropic aggregate, no directional banding.
+        h+=.012f*(surfaceNoise2(u,v,18,18,503)-.5f);
+        h+=.009f*(surfaceNoise2(u,v,36,36,509)-.5f);
+        h+=.006f*(surfaceNoise2(u,v,72,72,521)-.5f);
+        h+=.004f*(surfaceNoise2(u,v,144,144,523)-.5f);
+        h+=.002f*(surfaceNoise2(u,v,288,288,541)-.5f);
+    }
     else{h+=.012f*(surfaceNoise2(u,v,12,12,601)-.5f)+.008f*(surfaceNoise2(u,v,24,24,607)-.5f)+.005f*(surfaceNoise2(u,v,48,48,613)-.5f)+.003f*(surfaceNoise2(u,v,96,96,617)-.5f);}
     return h;
 }
@@ -893,7 +900,7 @@ dbName, dbName, macro, blend, Ogre::HlmsParamVec());
 if (surfaceFamily > 0) {
     db->setWorkflow(Ogre::HlmsPbsDatablock::MetallicWorkflow);db->setMetalness(0.0f);
     float roughness=0.90f,normalWeight=0.42f,tile=220.0f;
-    switch(surfaceFamily){case 1:roughness=0.93f;normalWeight=0.24f;tile=18.0f;break;case 2:roughness=0.96f;normalWeight=0.58f;tile=245.0f;break;case 3:roughness=0.88f;normalWeight=0.32f;tile=190.0f;break;case 4:roughness=0.84f;normalWeight=0.27f;tile=420.0f;break;case 5:roughness=0.78f;normalWeight=0.22f;tile=1.0f;break;case 6:roughness=0.92f;normalWeight=0.20f;tile=1.0f;break;}
+    switch(surfaceFamily){case 1:roughness=0.93f;normalWeight=0.24f;tile=18.0f;break;case 2:roughness=0.96f;normalWeight=0.58f;tile=245.0f;break;case 3:roughness=0.88f;normalWeight=0.32f;tile=190.0f;break;case 4:roughness=0.84f;normalWeight=0.27f;tile=420.0f;break;case 5:roughness=0.86f;normalWeight=0.16f;tile=12.0f;break;case 6:roughness=0.92f;normalWeight=0.20f;tile=1.0f;break;}
     db->setDiffuse(Ogre::Vector3(tr,tg,tb));db->setRoughness(roughness);
     const uint32_t normalId=ctx->groundNormalIds[surfaceFamily-1];const auto normalIt=ctx->textures.find(normalId);
     if(normalId && normalIt!=ctx->textures.end() && normalIt->second.gpu){db->setTexture(Ogre::PBSM_DETAIL0_NM,normalIt->second.gpu,ctx->anisoSampler);db->setDetailMapWeight(0,1.0f);db->setDetailNormalWeight(0,normalWeight);db->setDetailMapOffsetScale(0,Ogre::Vector4(0.0f,0.0f,tile,tile));}
