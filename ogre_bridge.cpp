@@ -195,6 +195,8 @@ static void registerHlms(Ogre::Root* root) {
     auto& rgm = Ogre::ResourceGroupManager::getSingleton();
     rgm.addResourceLocation(mediaRoot + "2.0/scripts/materials/Common", "FileSystem", "General");
     rgm.addResourceLocation(mediaRoot + "2.0/scripts/materials/Common/HLSL", "FileSystem", "General");
+    rgm.addResourceLocation(mediaRoot + "2.0/scripts/materials/ScreenSpaceReflections", "FileSystem", "General");
+    rgm.addResourceLocation(mediaRoot + "2.0/scripts/materials/ScreenSpaceReflections/HLSL", "FileSystem", "General");
     const Ogre::String waterMediaRoot = getBridgeProjectRoot() + "/water_media";
     rgm.addResourceLocation(waterMediaRoot, "FileSystem", "General");
     rgm.initialiseAllResourceGroups(true);
@@ -558,9 +560,15 @@ ctx->sceneMgr->getRenderQueue()->setSortRenderQueue(kSkyRenderQueueGroup, Ogre::
 
 // --- Official OGRE screen-space refraction workspace ---
 Ogre::CompositorManager2* compMgr = ctx->root->getCompositorManager2();
-const Ogre::String refractionWs = msaa > 1 ? "RefractionsWorkspaceMsaa" : "RefractionsWorkspace";
-if (compMgr->hasWorkspaceDefinition(refractionWs)) {
-    compMgr->addWorkspace(ctx->sceneMgr, ctx->window->getTexture(), ctx->camera, refractionWs, true);
+const Ogre::String highQualityWaterWs = msaa > 1
+    ? "ApexWaterSSRWorkspaceMsaa" : "ApexWaterSSRWorkspace";
+const Ogre::String refractionFallbackWs = msaa > 1
+    ? "RefractionsWorkspaceMsaa" : "RefractionsWorkspace";
+if (compMgr->hasWorkspaceDefinition(highQualityWaterWs)) {
+    compMgr->addWorkspace(ctx->sceneMgr, ctx->window->getTexture(), ctx->camera, highQualityWaterWs, true);
+    ctx->waterRefractionEnabled = true;
+} else if (compMgr->hasWorkspaceDefinition(refractionFallbackWs)) {
+    compMgr->addWorkspace(ctx->sceneMgr, ctx->window->getTexture(), ctx->camera, refractionFallbackWs, true);
     ctx->waterRefractionEnabled = true;
 } else {
     const Ogre::String fallbackWs = "ApexBasicWS";
