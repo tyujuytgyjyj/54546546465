@@ -1,6 +1,6 @@
 # ETK 1300 856tx AWD — Installation
 
-1. Copy **etk1300_model_pack.zip** unchanged into the game's `mods` folder.
+1. Overwrite the old **etk1300_model_pack.zip** in `mods` with the updated pack. Keep only one ETK 1300 pack/model copy, then fully close and restart the game; the loader caches the model for the current session.
 2. Extract `ogre_bridge.zip` into `C:\OgreSDK` so the source is exactly `C:\OgreSDK\ogre_bridge\ogre_bridge.cpp`.
 3. Run `C:\OgreSDK\ogre_bridge\BUILD_BRIDGE.cmd`. It rebuilds the Release DLL and import library using the configured OGRE-Next SDK.
 4. Replace `main.zip` and `level.zip` with the updated files from this repository, then rebuild the Rust client. The updated `build.rs` checks that the DLL is newer than its C++ source and copies it beside the Cargo executable; this avoids silently launching an older DLL.
