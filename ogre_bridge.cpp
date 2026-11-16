@@ -985,11 +985,23 @@ db->setDiffuse(Ogre::Vector3(tr * 0.85f, tg * 0.85f, tb * 0.85f));
 db->setMetalness(0.04f);
 db->setRoughness(0.68f);
 } else if (spec > 0.85f && spec <= 0.95f) {
-// جنوط كروم وألمنيوم ومصابيح
+// Brushed alloy wheels, chrome and aluminium trim.
 db->setWorkflow(Ogre::HlmsPbsDatablock::MetallicWorkflow);
 db->setDiffuse(Ogre::Vector3(tr, tg, tb));
 db->setMetalness(0.92f);
-db->setRoughness(0.10f);
+db->setRoughness(0.16f);
+} else if (spec > 3.5f && spec < 3.7f) {
+// Alcantara, leather and seat upholstery: non-metallic with a broad soft highlight.
+db->setWorkflow(Ogre::HlmsPbsDatablock::MetallicWorkflow);
+db->setDiffuse(Ogre::Vector3(tr, tg, tb));
+db->setMetalness(0.0f);
+db->setRoughness(0.84f);
+} else if (spec > 3.1f && spec < 3.3f) {
+// Carbon-fibre composite: dark, low-metalness, satin clear surface.
+db->setWorkflow(Ogre::HlmsPbsDatablock::MetallicWorkflow);
+db->setDiffuse(Ogre::Vector3(tr, tg, tb));
+db->setMetalness(0.12f);
+db->setRoughness(0.31f);
 } else {
 // أسفلت ومبانٍ وأعشاب وأشجار
 db->setWorkflow(Ogre::HlmsPbsDatablock::MetallicWorkflow);
