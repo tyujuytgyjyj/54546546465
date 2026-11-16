@@ -93,6 +93,9 @@ struct OgreContext {
     Ogre::SceneNode* uiNode = nullptr;
     const Ogre::HlmsSamplerblock* anisoSampler = nullptr;
     const Ogre::HlmsSamplerblock* pointSampler = nullptr;
+    Ogre::HlmsPbsDatablock* waterDatablock = nullptr;
+    uint32_t waterNormalIds[3] = { 0, 0, 0 };
+    bool waterRefractionEnabled = false;
 
     uint32_t next_tex_id = 1;
     std::unordered_map<uint32_t, TexInfo> textures;
@@ -109,13 +112,13 @@ struct OgreContext {
 
 static OgreContext* g_active_ctx = nullptr;
 
-// OGRE-Next 3.x uses numeric queue IDs (the legacy RENDER_QUEUE_* enum is absent).
-// ManualObject2 is a v2 object: keep every queue in 0..99 (FAST mode).
-// Draw order: sky -> opaque world -> transparent water/glass -> UI.
+// OGRE-Next 3.x uses numeric queue IDs.
+// Queue 200 is reserved for the native HLMS refractive-object compositor pass.
 static constexpr uint8_t kSkyRenderQueueGroup = 5;
 static constexpr uint8_t kWorldRenderQueueGroup = 50;
 static constexpr uint8_t kTransparentRenderQueueGroup = 95;
 static constexpr uint8_t kUiRenderQueueGroup = 99;
+static constexpr uint8_t kWaterRenderQueueGroup = 200;
 
 // ---------------------------------------------------------------------------
 // WndProc hook
@@ -138,6 +141,26 @@ static LRESULT CALLBACK BridgeWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 // ---------------------------------------------------------------------------
 // HLMS registration
 // ---------------------------------------------------------------------------
+static std::string getBridgeProjectRoot() {
+    HMODULE module = nullptr;
+    GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(&getBridgeProjectRoot), &module);
+    char modulePath[MAX_PATH] = {};
+    const DWORD length = module ? GetModuleFileNameA(module, modulePath, MAX_PATH) : 0;
+    if (length == 0 || length >= MAX_PATH) return ".";
+    std::string path(modulePath, length);
+    size_t slash = path.find_last_of("\\/");
+    if (slash == std::string::npos) return ".";
+    path.resize(slash);
+    for (int i = 0; i < 2; ++i) {
+        slash = path.find_last_of("\\/");
+        if (slash == std::string::npos) return ".";
+        path.resize(slash);
+    }
+    return path;
+}
+
 static void registerHlms(Ogre::Root* root) {
     Ogre::String mediaRoot =
         "C:/biqfr/build_ogre_scripts-v3-0/Ogre/ogre-next/Samples/Media/";
@@ -170,8 +193,10 @@ static void registerHlms(Ogre::Root* root) {
     setupHlms(true);
 
     auto& rgm = Ogre::ResourceGroupManager::getSingleton();
-    rgm.addResourceLocation(mediaRoot + "2.0/scripts/materials/Common",      "FileSystem", "General");
+    rgm.addResourceLocation(mediaRoot + "2.0/scripts/materials/Common", "FileSystem", "General");
     rgm.addResourceLocation(mediaRoot + "2.0/scripts/materials/Common/HLSL", "FileSystem", "General");
+    const Ogre::String waterMediaRoot = getBridgeProjectRoot() + "/water_media";
+    rgm.addResourceLocation(waterMediaRoot, "FileSystem", "General");
     rgm.initialiseAllResourceGroups(true);
 }
 
@@ -279,10 +304,143 @@ BRIDGE_API void ogre_set_texture_filter(void* raw_ctx, uint32_t tex_id, bool lin
     OgreContext* ctx = (OgreContext*)raw_ctx;
     auto it = ctx->textures.find(tex_id);
     if (it == ctx->textures.end()) return;
-    // Filter mode is applied to datablocks created after this call. The Rust wrapper
-    // calls this as soon as a texture is created, before its first draw/use.
     it->second.linear_filter = linear_filter;
 }
+
+static uint32_t createProceduralWaterNormal(OgreContext* ctx, const char* textureName, int variant) {
+    if (!ctx || !ctx->root || !textureName) return 0;
+    constexpr uint32_t width = 512, height = 512;
+    constexpr float tau = 6.2831853071795864769f;
+    struct NormalWave { float kx, ky, amplitude, phase; };
+    static const NormalWave waveSets[3][8] = {
+        {
+            {2,3,0.070f,0.10f},{5,-3,0.045f,1.70f},{7,6,0.028f,2.30f},{9,-7,0.018f,0.80f},
+            {4,11,0.020f,2.80f},{13,5,0.012f,1.20f},{15,-9,0.008f,0.45f},{8,17,0.006f,2.10f}
+        },
+        {
+            {5,8,0.050f,0.30f},{11,-7,0.030f,1.30f},{17,9,0.020f,2.20f},{21,-13,0.014f,0.75f},
+            {9,23,0.013f,2.75f},{27,5,0.010f,1.80f},{31,-17,0.007f,0.10f},{15,33,0.006f,2.55f}
+        },
+        {
+            {13,17,0.028f,0.50f},{23,-19,0.020f,1.10f},{31,11,0.014f,2.00f},{39,-27,0.010f,0.35f},
+            {17,43,0.009f,2.65f},{47,21,0.007f,1.50f},{53,-31,0.005f,0.95f},{29,57,0.004f,2.35f}
+        }
+    };
+    const NormalWave* waves = waveSets[std::max(0, std::min(variant, 2))];
+    const float strength = variant == 0 ? 0.085f : (variant == 1 ? 0.040f : 0.028f);
+    std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4u);
+    for (uint32_t y = 0; y < height; ++y) {
+        const float v = static_cast<float>(y) / static_cast<float>(height);
+        for (uint32_t x = 0; x < width; ++x) {
+            const float u = static_cast<float>(x) / static_cast<float>(width);
+            float dhdu = 0.0f, dhdv = 0.0f;
+            for (int i = 0; i < 8; ++i) {
+                const NormalWave& w = waves[i];
+                const float phase = tau * (w.kx * u + w.ky * v) + w.phase;
+                const float slope = w.amplitude * std::cos(phase) * tau;
+                dhdu += slope * w.kx;
+                dhdv += slope * w.ky;
+            }
+            Ogre::Vector3 n(-dhdu * strength, -dhdv * strength, 1.0f);
+            n.normalise();
+            const size_t at = (static_cast<size_t>(y) * width + x) * 4u;
+            pixels[at+0] = static_cast<uint8_t>((n.x * 0.5f + 0.5f) * 255.0f);
+            pixels[at+1] = static_cast<uint8_t>((n.y * 0.5f + 0.5f) * 255.0f);
+            pixels[at+2] = static_cast<uint8_t>((n.z * 0.5f + 0.5f) * 255.0f);
+            pixels[at+3] = 255;
+        }
+    }
+    try {
+        Ogre::TextureGpuManager* texMgr = ctx->root->getRenderSystem()->getTextureGpuManager();
+        Ogre::TextureGpu* tex = texMgr->createTexture(
+            textureName, Ogre::GpuPageOutStrategy::Discard,
+            Ogre::TextureFlags::ManualTexture, Ogre::TextureTypes::Type2D);
+        tex->setResolution(width, height);
+        tex->setPixelFormat(Ogre::PFG_RGBA8_UNORM); // linear normal data
+        tex->scheduleTransitionTo(Ogre::GpuResidency::Resident);
+        Ogre::StagingTexture* staging =
+            texMgr->getStagingTexture(width, height, 1, 1, Ogre::PFG_RGBA8_UNORM);
+        staging->startMapRegion();
+        Ogre::TextureBox box =
+            staging->mapRegion(width, height, 1, 1, Ogre::PFG_RGBA8_UNORM);
+        for (uint32_t y = 0; y < height; ++y)
+            memcpy(static_cast<uint8_t*>(box.at(0,y,0)),
+                   pixels.data() + static_cast<size_t>(y) * width * 4u,
+                   static_cast<size_t>(width) * 4u);
+        staging->stopMapRegion();
+        staging->upload(box, tex, 0, nullptr, nullptr, false);
+        texMgr->removeStagingTexture(staging);
+        const uint32_t id = ctx->next_tex_id++;
+        ctx->textures[id] = { tex, false, true };
+        return id;
+    } catch (...) { return 0; }
+}
+
+static void createWaterPbsMaterial(OgreContext* ctx) {
+    if (!ctx || !ctx->root) return;
+    Ogre::HlmsPbs* pbs = static_cast<Ogre::HlmsPbs*>(
+        ctx->root->getHlmsManager()->getHlms(Ogre::HLMS_PBS));
+    if (!pbs) return;
+    ctx->waterNormalIds[0] = createProceduralWaterNormal(ctx, "ApexWaterNormal_Macro", 0);
+    ctx->waterNormalIds[1] = createProceduralWaterNormal(ctx, "ApexWaterNormal_Detail", 1);
+    ctx->waterNormalIds[2] = createProceduralWaterNormal(ctx, "ApexWaterNormal_Micro", 2);
+
+    Ogre::HlmsMacroblock macro;
+    macro.mDepthCheck = true;
+    macro.mDepthWrite = false;
+    macro.mCullMode = Ogre::CULL_NONE;
+    Ogre::HlmsBlendblock blend;
+    ctx->waterDatablock = static_cast<Ogre::HlmsPbsDatablock*>(
+        pbs->createDatablock("ApexWaterPbr", "ApexWaterPbr", macro, blend, Ogre::HlmsParamVec()));
+    if (!ctx->waterDatablock) return;
+
+    Ogre::HlmsPbsDatablock* db = ctx->waterDatablock;
+    db->setWorkflow(Ogre::HlmsPbsDatablock::SpecularAsFresnelWorkflow);
+    db->setDiffuse(Ogre::Vector3(0.075f, 0.30f, 0.37f));
+    db->setSpecular(Ogre::Vector3(1.0f, 1.0f, 1.0f));
+    db->setIndexOfRefraction(Ogre::Vector3(1.333f, 1.333f, 1.333f), false);
+    db->setRoughness(0.055f);
+    db->setNormalMapWeight(1.0f);
+    db->setTwoSidedLighting(true, false);
+    db->setTransparency(
+        0.52f,
+        ctx->waterRefractionEnabled ? Ogre::HlmsPbsDatablock::Refractive
+                                   : Ogre::HlmsPbsDatablock::Transparent,
+        false, true);
+    db->setRefractionStrength(0.105f);
+
+    auto getTexture = [&](uint32_t id) -> Ogre::TextureGpu* {
+        const auto it = ctx->textures.find(id);
+        return it == ctx->textures.end() ? nullptr : it->second.gpu;
+    };
+    Ogre::TextureGpu* macroNormal = getTexture(ctx->waterNormalIds[0]);
+    Ogre::TextureGpu* detailNormal = getTexture(ctx->waterNormalIds[1]);
+    Ogre::TextureGpu* microNormal = getTexture(ctx->waterNormalIds[2]);
+    if (macroNormal) db->setTexture(Ogre::PBSM_NORMAL, macroNormal, ctx->anisoSampler);
+    if (detailNormal) {
+        db->setTexture(Ogre::PBSM_DETAIL0_NM, detailNormal, ctx->anisoSampler);
+        db->setDetailMapWeight(0, 1.0f);
+        db->setDetailNormalWeight(0, 0.72f);
+        db->setDetailMapOffsetScale(0, Ogre::Vector4(0.0f,0.0f,72.0f,72.0f));
+    }
+    if (microNormal) {
+        db->setTexture(Ogre::PBSM_DETAIL1_NM, microNormal, ctx->anisoSampler);
+        db->setDetailMapWeight(1, 1.0f);
+        db->setDetailNormalWeight(1, 0.32f);
+        db->setDetailMapOffsetScale(1, Ogre::Vector4(0.0f,0.0f,210.0f,210.0f));
+    }
+}
+
+static void updateWaterPbsAnimation(OgreContext* ctx) {
+    if (!ctx || !ctx->waterDatablock) return;
+    const float t = static_cast<float>(GetTickCount64()) * 0.001f;
+    ctx->waterDatablock->setDetailMapOffsetScale(
+        0, Ogre::Vector4(std::fmod(t*0.012f,1.0f),std::fmod(t*0.007f,1.0f),72.0f,72.0f));
+    ctx->waterDatablock->setDetailMapOffsetScale(
+        1, Ogre::Vector4(std::fmod(-t*0.008f+1.0f,1.0f),std::fmod(t*0.010f,1.0f),210.0f,210.0f));
+}
+
+
 
 // ---------------------------------------------------------------------------
 // Init
@@ -398,17 +556,22 @@ ctx->skyNode = ctx->camNode->createChildSceneNode(Ogre::SCENE_DYNAMIC);
 ctx->skyNode->attachObject(ctx->skyManual);
 ctx->sceneMgr->getRenderQueue()->setSortRenderQueue(kSkyRenderQueueGroup, Ogre::RenderQueue::DisableSort);
 
-// --- Workspace أساسي ---
+// --- Official OGRE screen-space refraction workspace ---
 Ogre::CompositorManager2* compMgr = ctx->root->getCompositorManager2();
-const Ogre::String wsName = "ApexBasicWS";
-if (!compMgr->hasWorkspaceDefinition(wsName)) {
-compMgr->createBasicWorkspaceDef(
-wsName, Ogre::ColourValue(0.006f, 0.012f, 0.028f, 1.0f), Ogre::IdString());
+const Ogre::String refractionWs = msaa > 1 ? "RefractionsWorkspaceMsaa" : "RefractionsWorkspace";
+if (compMgr->hasWorkspaceDefinition(refractionWs)) {
+    compMgr->addWorkspace(ctx->sceneMgr, ctx->window->getTexture(), ctx->camera, refractionWs, true);
+    ctx->waterRefractionEnabled = true;
+} else {
+    const Ogre::String fallbackWs = "ApexBasicWS";
+    if (!compMgr->hasWorkspaceDefinition(fallbackWs))
+        compMgr->createBasicWorkspaceDef(fallbackWs, Ogre::ColourValue(0.006f,0.012f,0.028f,1.0f), Ogre::IdString());
+    compMgr->addWorkspace(ctx->sceneMgr, ctx->window->getTexture(), ctx->camera, fallbackWs, true);
+    ctx->waterRefractionEnabled = false;
 }
-compMgr->addWorkspace(ctx->sceneMgr, ctx->window->getTexture(), ctx->camera, wsName, true);
-// --- نسيج أبيض افتراضي (id = 1) ---
 uint32_t white_pixel = 0xFFFFFFFF;
 ogre_create_texture(ctx, 1, 1, (const uint8_t*)&white_pixel, false);
+createWaterPbsMaterial(ctx);
 return ctx;
 }
 // ---------------------------------------------------------------------------
@@ -418,7 +581,8 @@ static void populateManualObject(
 Ogre::ManualObject* mo,
 const std::string& dbName,
 const std::vector<BridgeVertex3D>& verts,
-const std::vector<uint16_t>& indices)
+const std::vector<uint16_t>& indices,
+bool addWaterTangents)
 {
 mo->clear();
 if (verts.empty() || indices.size() < 3) return;
@@ -428,7 +592,17 @@ Ogre::Vector3 bmax(-1e9f, -1e9f, -1e9f);
 for (size_t i = 0; i < verts.size(); ++i) {
 const BridgeVertex3D& v = verts[i];
 mo->position(v.px, v.py, v.pz);
-mo->normal(v.nx, v.ny, v.nz);
+Ogre::Vector3 normal(v.nx, v.ny, v.nz);
+if (normal.squaredLength() < 1.0e-8f) normal = Ogre::Vector3::UNIT_Y;
+else normal.normalise();
+mo->normal(normal);
+if (addWaterTangents) {
+    Ogre::Vector3 tangent = Ogre::Vector3::UNIT_X - normal * normal.dotProduct(Ogre::Vector3::UNIT_X);
+    if (tangent.squaredLength() < 1.0e-6f)
+        tangent = Ogre::Vector3::UNIT_Z - normal * normal.dotProduct(Ogre::Vector3::UNIT_Z);
+    tangent.normalise();
+    mo->tangent(tangent);
+}
 mo->textureCoord(v.u, v.v);
 mo->colour(v.r / 255.0f, v.g / 255.0f, v.b / 255.0f, v.a / 255.0f);
 bmin.makeFloor(Ogre::Vector3(v.px, v.py, v.pz));
@@ -479,7 +653,7 @@ cm.cpu_indices.assign(indices, indices + icount);
 if (cm.is_water) cm.animated_verts = cm.cpu_verts;
 cm.avg_spec = verts->spec;
 for (size_t i = 0; i < cm.pool_objs.size(); ++i) {
-populateManualObject(cm.pool_objs[i], cm.pool_db_names[i], cm.cpu_verts, cm.cpu_indices);
+populateManualObject(cm.pool_objs[i], cm.pool_db_names[i], cm.cpu_verts, cm.cpu_indices, cm.is_water);
 }
 }
 
@@ -616,7 +790,7 @@ CachedMesh& cm = it->second;
 // Water has its own reflective vertex-colour pass; it must not use the generic
 // PBS alpha material that was washing out the ground under incorrect water cells.
 std::string dbName = cm.is_water
-    ? std::string("ApexWaterSurface")
+    ? std::string("ApexWaterPbr")
     : getOrCreatePbsDatablockName(
         ctx, cm.tex_id, tint_r, tint_g, tint_b,
         cm.avg_spec, is_glass || cm.is_glass, false, cm.base_a);
@@ -624,7 +798,7 @@ size_t idx = cm.used_this_frame++;
 if (idx >= cm.pool_objs.size()) {
 Ogre::ManualObject* newObj = ctx->sceneMgr->createManualObject(Ogre::SCENE_DYNAMIC);
 newObj->setRenderQueueGroup(kWorldRenderQueueGroup);
-populateManualObject(newObj, dbName, cm.cpu_verts, cm.cpu_indices);
+populateManualObject(newObj, dbName, cm.cpu_verts, cm.cpu_indices, cm.is_water);
 Ogre::SceneNode* newNode = ctx->sceneMgr->getRootSceneNode(Ogre::SCENE_DYNAMIC)
 ->createChildSceneNode(Ogre::SCENE_DYNAMIC);
 newNode->attachObject(newObj);
@@ -639,12 +813,13 @@ Ogre::ManualObject* mo   = cm.pool_objs[idx];
 Ogre::SceneNode*    node = cm.pool_nodes[idx];
 // Transparent meshes must be rendered after opaque world geometry but before UI.
 const bool is_transparent = cm.is_water || is_glass || cm.is_glass;
-mo->setRenderQueueGroup(is_transparent ? kTransparentRenderQueueGroup : kWorldRenderQueueGroup);
+const uint8_t queueGroup = cm.is_water && ctx->waterRefractionEnabled
+    ? kWaterRenderQueueGroup
+    : (is_transparent ? kTransparentRenderQueueGroup : kWorldRenderQueueGroup);
+mo->setRenderQueueGroup(queueGroup);
 mo->setCastShadows(!is_transparent);
 mo->setVisible(true);
 if (cm.is_water) {
-    // Multi-scale travelling waves with analytic normals and per-frame sky
-    // reflection. Clouds, sunset and the sun glints are shared with the sky pass.
     const float waveTime = static_cast<float>(GetTickCount64()) * 0.001f;
     const Ogre::Quaternion waterOrientation(qw, qx, qy, qz);
     const Ogre::Vector3 waterPosition(px, py, pz);
@@ -652,37 +827,40 @@ if (cm.is_water) {
     const Ogre::Vector3 sunDirection = ctx->skySunDir.normalisedCopy();
     auto& waveVerts = cm.animated_verts;
     if (waveVerts.size() != cm.cpu_verts.size()) waveVerts.resize(cm.cpu_verts.size());
+
+    auto addGerstner = [&](float x, float z, float dx, float dz, float wavelength,
+                           float amplitude, float speed, float steepness,
+                           Ogre::Vector3& displacement, Ogre::Vector3& normal) {
+        const float k = 6.28318530718f / wavelength;
+        const float phase = k * (dx * x + dz * z) + waveTime * speed;
+        const float sn = std::sin(phase), cs = std::cos(phase);
+        displacement.x += steepness * amplitude * dx * cs;
+        displacement.y += amplitude * sn;
+        displacement.z += steepness * amplitude * dz * cs;
+        normal.x -= dx * k * amplitude * cs;
+        normal.y -= steepness * k * amplitude * sn;
+        normal.z -= dz * k * amplitude * cs;
+    };
+
     for (size_t vi = 0; vi < cm.cpu_verts.size(); ++vi) {
         const BridgeVertex3D& src = cm.cpu_verts[vi];
         BridgeVertex3D& dst = waveVerts[vi];
         dst = src;
-        const float x = src.px;
-        const float z = src.pz;
-        // Port of the original water.frag wave field: several crossing wave
-        // directions plus small drifting ripples. Frequencies stay below the
-        // water mesh's vertex sampling limit to avoid striped/aliased reflections.
-        const float a = (x * 0.60f + z * 0.80f) * 0.55f + waveTime * 1.30f;
-        const float b = (x * -0.80f + z * 0.50f) * 0.90f + waveTime * 1.90f;
-        const float c = (x * 0.30f - z * 0.95f) * 1.25f + waveTime * 2.60f;
-        const float d = (x * 0.91f + z * 0.41f) * 0.42f - waveTime * 0.83f;
-        const float ca = std::cos(a), cb = std::cos(b), cc = std::cos(c), cd = std::cos(d);
-        const float waveX = 0.030f * 0.55f * 0.60f * ca
-                          + 0.020f * 0.90f * -0.80f * cb
-                          + 0.012f * 1.25f * 0.30f * cc
-                          + 0.010f * 0.42f * 0.91f * cd;
-        const float waveZ = 0.030f * 0.55f * 0.80f * ca
-                          + 0.020f * 0.90f * 0.50f * cb
-                          - 0.012f * 1.25f * 0.95f * cc
-                          + 0.010f * 0.42f * 0.41f * cd;
-        dst.py += 0.030f * std::sin(a) + 0.016f * std::sin(b)
-                + 0.007f * std::sin(c) + 0.004f * std::sin(d);
-        Ogre::Vector3 localNormal(-waveX, 1.0f, -waveZ);
+        const float x = src.px, z = src.pz;
+        Ogre::Vector3 displacement = Ogre::Vector3::ZERO;
+        Ogre::Vector3 localNormal = Ogre::Vector3::UNIT_Y;
+        addGerstner(x,z, 0.88f, 0.47f,26.0f,0.070f,1.00f,0.42f,displacement,localNormal);
+        addGerstner(x,z,-0.36f, 0.93f,15.0f,0.040f,1.27f,0.32f,displacement,localNormal);
+        addGerstner(x,z, 0.14f,-0.99f, 8.5f,0.018f,1.72f,0.20f,displacement,localNormal);
         localNormal.normalise();
+        dst.px = src.px + displacement.x;
+        dst.py = src.py + displacement.y;
+        dst.pz = src.pz + displacement.z;
         dst.nx = localNormal.x; dst.ny = localNormal.y; dst.nz = localNormal.z;
 
-        const Ogre::Vector3 localPosition(x * sx, dst.py * sy, z * sz);
+        const Ogre::Vector3 localPosition(dst.px*sx, dst.py*sy, dst.pz*sz);
         const Ogre::Vector3 worldPosition = waterPosition + waterOrientation * localPosition;
-        Ogre::Vector3 worldNormal(localNormal.x / sx, localNormal.y / sy, localNormal.z / sz);
+        Ogre::Vector3 worldNormal(localNormal.x/sx, localNormal.y/sy, localNormal.z/sz);
         worldNormal = (waterOrientation * worldNormal).normalisedCopy();
         Ogre::Vector3 viewDirection = cameraPosition - worldPosition;
         if (viewDirection.squaredLength() < 1.0e-6f) viewDirection = Ogre::Vector3::UNIT_Y;
@@ -693,54 +871,37 @@ if (cm.is_water) {
         if (reflected.y < 0.0f) reflected.y = -reflected.y;
         if (reflected.squaredLength() < 1.0e-6f) reflected = Ogre::Vector3::UNIT_Y;
         else reflected.normalise();
-
         const Ogre::Vector3 reflectedSky = waterReflectionColour(
             reflected, sunDirection, ctx->skySunElevation, worldPosition, waveTime);
-        const Ogre::Vector3 sourceColour(src.r / 255.0f, src.g / 255.0f, src.b / 255.0f);
-        const Ogre::Vector3 deepWater(
-            0.006f + sourceColour.x * 0.035f,
-            0.034f + sourceColour.y * 0.075f,
-            0.050f + sourceColour.z * 0.095f);
-        const float fresnel = 0.02f + 0.98f * std::pow(1.0f - ndv, 5.0f);
-        // Dielectric water reflects little at head-on angles and almost
-        // everything at grazing angles, matching the Fresnel response of the
-        // original water shader instead of tinting the whole sea with the sky.
-        const float reflectionWeight = 0.08f + 0.90f * fresnel;
-        Ogre::Vector3 waterColour =
-            deepWater * (1.0f - reflectionWeight) +
-            reflectedSky * (reflectionWeight * 0.88f);
 
+        const Ogre::Vector3 srcColour(src.r/255.0f,src.g/255.0f,src.b/255.0f);
+        const Ogre::Vector3 deepWater(0.008f+srcColour.x*0.050f,
+                                      0.045f+srcColour.y*0.105f,
+                                      0.065f+srcColour.z*0.125f);
+        const float fresnel = 0.02f + 0.98f * std::pow(1.0f-ndv,5.0f);
+        const float reflectionWeight = 0.10f + 0.78f*fresnel;
+        Ogre::Vector3 waterColour = deepWater*(1.0f-reflectionWeight) +
+                                    reflectedSky*(reflectionWeight*0.75f);
         Ogre::Vector3 halfVector = viewDirection + sunDirection;
         if (halfVector.squaredLength() < 1.0e-6f) halfVector = Ogre::Vector3::UNIT_Y;
         else halfVector.normalise();
-        const float sunGlint =
-            std::pow(std::fmax(worldNormal.dotProduct(halfVector), 0.0f), 190.0f) *
-            skySmoothstep(-0.10f, 0.22f, ctx->skySunElevation);
-        const float solarDisc =
-            std::pow(std::fmax(reflected.dotProduct(sunDirection), 0.0f), 210.0f) *
-            skySmoothstep(-0.06f, 0.12f, ctx->skySunElevation);
-        const float ripple = 0.5f + 0.5f * std::sin(
-            x * 0.73f + z * 0.41f + waveTime * 1.7f);
-        waterColour += Ogre::Vector3(1.0f, 0.78f, 0.53f) *
-                       (sunGlint * 1.15f + solarDisc * 0.72f);
-        const float microRipple = 0.5f + 0.5f * std::sin(
-            x * 1.13f + z * 0.77f + waveTime * 2.35f);
-        waterColour += Ogre::Vector3(0.010f, 0.024f, 0.030f) *
-                       (ripple * (0.12f + fresnel * 0.30f));
-        waterColour += Ogre::Vector3(0.004f, 0.012f, 0.016f) *
-                       (microRipple * (0.12f + fresnel * 0.18f));
-        // Alpha is used as a shoreline marker by plane_cells; output remains
-        // opaque so actual land is never washed out by transparent water.
-        const float shoreFoam = skyClamp01((242.0f - static_cast<float>(src.a)) / 52.0f);
-        waterColour = skyMix(waterColour, Ogre::Vector3(0.72f, 0.84f, 0.91f),
-                             shoreFoam * 0.46f);
+        const float sunGlint = std::pow(std::fmax(worldNormal.dotProduct(halfVector),0.0f),150.0f) *
+                               skySmoothstep(-0.10f,0.22f,ctx->skySunElevation);
+        waterColour += Ogre::Vector3(1.0f,0.82f,0.63f) * (sunGlint*0.65f);
 
-        dst.r = static_cast<uint8_t>(skyClamp01(waterColour.x) * 255.0f);
-        dst.g = static_cast<uint8_t>(skyClamp01(waterColour.y) * 255.0f);
-        dst.b = static_cast<uint8_t>(skyClamp01(waterColour.z) * 255.0f);
-        dst.a = 255; // opaque: do not alpha-wash roads or terrain underneath.
+        const float shoreSignal = skyClamp01((255.0f-static_cast<float>(src.a))/45.0f);
+        const float foamA = 0.5f+0.5f*std::sin(x*0.31f+z*0.19f+waveTime*0.82f);
+        const float foamB = 0.5f+0.5f*std::sin(x*0.17f-z*0.37f-waveTime*0.54f);
+        const float foamNoise = 0.55f*foamA+0.45f*foamB;
+        const float shoreFoam = skySmoothstep(0.02f,0.92f,shoreSignal)*(0.68f+0.32f*foamNoise);
+        waterColour = skyMix(waterColour,Ogre::Vector3(0.78f,0.90f,0.95f),shoreFoam*0.72f);
+
+        dst.r = static_cast<uint8_t>(skyClamp01(waterColour.x)*255.0f);
+        dst.g = static_cast<uint8_t>(skyClamp01(waterColour.y)*255.0f);
+        dst.b = static_cast<uint8_t>(skyClamp01(waterColour.z)*255.0f);
+        dst.a = 255;
     }
-    populateManualObject(mo, dbName, waveVerts, cm.cpu_indices);
+    populateManualObject(mo, dbName, waveVerts, cm.cpu_indices, true);
 }
 node->setPosition(Ogre::Vector3(px, py, pz));
 node->setOrientation(Ogre::Quaternion(qw, qx, qy, qz));  // ترتيب Ogre: w,x,y,z
@@ -1198,6 +1359,7 @@ float sw = (float)(ctx->window->getWidth()  > 0 ? ctx->window->getWidth()  : 1);
 float sh = (float)(ctx->window->getHeight() > 0 ? ctx->window->getHeight() : 1);
 float aspect = sw / sh;
 updateSkyGradient(ctx, sw, sh);
+updateWaterPbsAnimation(ctx);
 const float base_d = 1.5f;
 float tan_half_fov = std::tan(ctx->camera->getFOVy().valueRadians() * 0.5f);
 for (const UiCmd& cmd : ctx->ui_cmds) {
