@@ -225,7 +225,17 @@ static bool uploadRgbaMipChain(OgreContext* ctx,Ogre::TextureGpu* tex,const uint
     if(!ctx||!tex||!rgba||!width||!height)return false;
     auto* tm=ctx->root->getRenderSystem()->getTextureGpuManager();
     try {
-        tex->setNumMipmaps(0);
+        // Ogre-Next 3.0 counts the base image as mip level 1. A value of
+        // zero is invalid and leaves the texture without a valid mip chain.
+        uint32_t mipWidth = width;
+        uint32_t mipHeight = height;
+        uint8_t mipLevels = 1;
+        while (mipWidth > 1u || mipHeight > 1u) {
+            mipWidth = std::max(1u, mipWidth / 2u);
+            mipHeight = std::max(1u, mipHeight / 2u);
+            ++mipLevels;
+        }
+        tex->setNumMipmaps(mipLevels);
         tex->scheduleTransitionTo(Ogre::GpuResidency::Resident);
         uint32_t w=width,h=height,mip=0;
         std::vector<uint8_t> level(rgba,rgba+static_cast<size_t>(w)*h*4u);
@@ -312,7 +322,8 @@ if (it == ctx->textures.end()) return;
     Ogre::TextureGpu* tex = it->second.gpu;
     Ogre::TextureGpuManager* texMgr = ctx->root->getRenderSystem()->getTextureGpuManager();
 
-    if (tex->getWidth() != width || tex->getHeight() != height) {
+    const bool resized = tex->getWidth() != width || tex->getHeight() != height;
+    if (resized) {
         const uint32_t old_width = tex->getWidth();
         const uint32_t old_height = tex->getHeight();
 
@@ -329,24 +340,13 @@ if (it == ctx->textures.end()) return;
                 vertex.v *= v_scale;
             }
         }
-
-        tex->scheduleTransitionTo(Ogre::GpuResidency::OnStorage);
-        tex->setResolution(width, height);
-        tex->scheduleTransitionTo(Ogre::GpuResidency::Resident);
     }
 
-    Ogre::StagingTexture* staging =
-        texMgr->getStagingTexture(width, height, 1, 1, Ogre::PFG_RGBA8_UNORM_SRGB);
-    staging->startMapRegion();
-    Ogre::TextureBox box = staging->mapRegion(width, height, 1, 1, Ogre::PFG_RGBA8_UNORM_SRGB);
-    for (uint32_t y = 0; y < height; ++y) {
-        memcpy((uint8_t*)box.at(0, y, 0),
-               rgba + (size_t)y * width * 4,
-               (size_t)width * 4);
-    }
-    staging->stopMapRegion();
-    staging->upload(box, tex, 0, nullptr, nullptr, false);
-    texMgr->removeStagingTexture(staging);
+    // ManualTexture transitions synchronously; move it out of residency before
+    // changing dimensions/mip count, then restore it through the common uploader.
+    tex->scheduleTransitionTo(Ogre::GpuResidency::OnStorage);
+    if (resized) tex->setResolution(width, height);
+    if (!uploadRgbaMipChain(ctx, tex, rgba, width, height, Ogre::PFG_RGBA8_UNORM_SRGB)) return;
 }
 
 BRIDGE_API void ogre_set_texture_filter(void* raw_ctx, uint32_t tex_id, bool linear_filter) {
@@ -614,7 +614,7 @@ static void createWaterPbsMaterial(OgreContext* ctx) {
     db->setNormalMapWeight(1.0f);
     db->setTwoSidedLighting(true, false);
     db->setTransparency(
-        0.52f,
+        0.92f,
         ctx->waterRefractionEnabled ? Ogre::HlmsPbsDatablock::Refractive
                                    : Ogre::HlmsPbsDatablock::Transparent,
         false, true);
