@@ -86,6 +86,15 @@ struct OgreContext {
     Ogre::Light* skyRimLight = nullptr;
     Ogre::ManualObject* skyManual = nullptr;
     Ogre::SceneNode* skyNode = nullptr;
+    Ogre::ManualObject* skyCloudManual = nullptr;
+    Ogre::SceneNode* skyCloudNode = nullptr;
+    Ogre::ManualObject* skyCirrusManual = nullptr;
+    Ogre::SceneNode* skyCirrusNode = nullptr;
+    Ogre::HlmsUnlitDatablock* skyCloudDatablock = nullptr;
+    Ogre::HlmsUnlitDatablock* skyCirrusDatablock = nullptr;
+    Ogre::TextureGpu* skyCloudTexture = nullptr;
+    Ogre::TextureGpu* skyCirrusTexture = nullptr;
+    uint32_t groundNormalIds[6] = { 0, 0, 0, 0, 0, 0 };
     Ogre::Vector3 skySunDir = Ogre::Vector3(0.35f, 0.15f, 0.4f);
     float skySunElevation = 0.15f;
 
@@ -115,6 +124,8 @@ static OgreContext* g_active_ctx = nullptr;
 // OGRE-Next 3.x uses numeric queue IDs.
 // Queue 200 is reserved for the native HLMS refractive-object compositor pass.
 static constexpr uint8_t kSkyRenderQueueGroup = 5;
+static constexpr uint8_t kSkyCloudRenderQueueGroup = 6;
+static constexpr uint8_t kSkyCirrusRenderQueueGroup = 7;
 static constexpr uint8_t kWorldRenderQueueGroup = 50;
 static constexpr uint8_t kTransparentRenderQueueGroup = 95;
 static constexpr uint8_t kUiRenderQueueGroup = 99;
@@ -307,6 +318,141 @@ BRIDGE_API void ogre_set_texture_filter(void* raw_ctx, uint32_t tex_id, bool lin
     auto it = ctx->textures.find(tex_id);
     if (it == ctx->textures.end()) return;
     it->second.linear_filter = linear_filter;
+}
+
+
+// ---------------------------------------------------------------------------
+// Tiled procedural normal maps for ground surfaces. Family IDs:
+// 1=sand, 2=dirt, 3=grass terrain, 4=terrain asphalt, 5=roads, 6=grass blades.
+// ---------------------------------------------------------------------------
+static float skyClamp01(float x);
+static float skySmoothstep(float a, float b, float x);
+static uint32_t surfaceHash2(int x,int y,int px,int py,uint32_t seed){
+    x%=px;if(x<0)x+=px;y%=py;if(y<0)y+=py;
+    uint32_t h=static_cast<uint32_t>(x)*0x8da6b343u^static_cast<uint32_t>(y)*0xd8163841u^seed;
+    h^=h>>16;h*=0x7feb352du;h^=h>>15;h*=0x846ca68bu;h^=h>>16;return h;
+}
+static float surfaceNoise2(float u,float v,int fx,int fy,uint32_t seed){
+    float x=u*fx,y=v*fy;int ix=(int)std::floor(x),iy=(int)std::floor(y);
+    float tx=x-ix,ty=y-iy;tx=tx*tx*(3.0f-2.0f*tx);ty=ty*ty*(3.0f-2.0f*ty);
+    const float k=1.0f/16777215.0f;
+    auto h=[&](int xx,int yy){return (surfaceHash2(xx,yy,fx,fy,seed)&0xffffffu)*k;};
+    return (h(ix,iy)*(1-tx)+h(ix+1,iy)*tx)*(1-ty)+(h(ix,iy+1)*(1-tx)+h(ix+1,iy+1)*tx)*ty;
+}
+static float surfaceHeight(float u,float v,int f){
+    constexpr float tau=6.2831853071795864769f;float h=0;
+    if(f==1){h+=.030f*std::sin(tau*(u*18+v*3));h+=.013f*std::sin(tau*(u*37+v*7+.21f));
+        h+=.025f*(surfaceNoise2(u,v,8,4,101)-.5f)+.015f*(surfaceNoise2(u,v,16,8,103)-.5f)+.008f*(surfaceNoise2(u,v,32,16,107)-.5f)+.004f*(surfaceNoise2(u,v,64,32,109)-.5f);}
+    else if(f==2){h+=.030f*(surfaceNoise2(u,v,7,7,211)-.5f)+.022f*(surfaceNoise2(u,v,14,14,223)-.5f)+.014f*(surfaceNoise2(u,v,28,28,227)-.5f)+.009f*(surfaceNoise2(u,v,56,56,229)-.5f)+.005f*(surfaceNoise2(u,v,112,112,233)-.5f);}
+    else if(f==3){h+=.030f*(surfaceNoise2(u,v,5,5,307)-.5f)+.018f*(surfaceNoise2(u,v,10,10,311)-.5f)+.012f*(surfaceNoise2(u,v,20,20,313)-.5f)+.008f*(surfaceNoise2(u,v,40,40,317)-.5f)+.004f*(surfaceNoise2(u,v,80,80,331)-.5f);}
+    else if(f==4){h+=.014f*(surfaceNoise2(u,v,18,18,401)-.5f)+.010f*(surfaceNoise2(u,v,36,36,409)-.5f)+.008f*(surfaceNoise2(u,v,72,72,419)-.5f)+.005f*(surfaceNoise2(u,v,144,144,421)-.5f);}
+    else if(f==5){h+=.010f*std::sin(tau*(u*11+v*2));h+=.014f*(surfaceNoise2(u,v,20,20,503)-.5f)+.010f*(surfaceNoise2(u,v,40,40,509)-.5f)+.007f*(surfaceNoise2(u,v,80,80,521)-.5f)+.004f*(surfaceNoise2(u,v,160,160,523)-.5f);}
+    else{h+=.012f*(surfaceNoise2(u,v,12,12,601)-.5f)+.008f*(surfaceNoise2(u,v,24,24,607)-.5f)+.005f*(surfaceNoise2(u,v,48,48,613)-.5f)+.003f*(surfaceNoise2(u,v,96,96,617)-.5f);}
+    return h;
+}
+static uint32_t createProceduralSurfaceNormal(OgreContext* ctx,const char* name,int family){
+    if(!ctx||!ctx->root||!name||family<1||family>6)return 0;
+    constexpr uint32_t w=512,h=512;constexpr float e=1.0f/512.0f;
+    std::vector<uint8_t> px((size_t)w*h*4u);const float strength=family==1?1.55f:(family==4?1.25f:1.40f);
+    for(uint32_t y=0;y<h;++y){float v=(float)y/h;for(uint32_t x=0;x<w;++x){float u=(float)x/w;
+        float dx=(surfaceHeight(u+e,v,family)-surfaceHeight(u-e,v,family))/(2*e);
+        float dy=(surfaceHeight(u,v+e,family)-surfaceHeight(u,v-e,family))/(2*e);
+        Ogre::Vector3 n(-dx*strength,-dy*strength,1);n.normalise();size_t a=((size_t)y*w+x)*4u;
+        px[a]=(uint8_t)((n.x*.5f+.5f)*255);px[a+1]=(uint8_t)((n.y*.5f+.5f)*255);px[a+2]=(uint8_t)((n.z*.5f+.5f)*255);px[a+3]=255;
+    }}
+    try{auto* tm=ctx->root->getRenderSystem()->getTextureGpuManager();
+        auto* tex=tm->createTexture(name,Ogre::GpuPageOutStrategy::Discard,Ogre::TextureFlags::ManualTexture,Ogre::TextureTypes::Type2D);
+        tex->setResolution(w,h);tex->setPixelFormat(Ogre::PFG_RGBA8_UNORM);tex->scheduleTransitionTo(Ogre::GpuResidency::Resident);
+        auto* st=tm->getStagingTexture(w,h,1,1,Ogre::PFG_RGBA8_UNORM);st->startMapRegion();
+        Ogre::TextureBox box=st->mapRegion(w,h,1,1,Ogre::PFG_RGBA8_UNORM);
+        for(uint32_t y=0;y<h;++y)memcpy((uint8_t*)box.at(0,y,0),px.data()+(size_t)y*w*4u,(size_t)w*4u);
+        st->stopMapRegion();st->upload(box,tex,0,nullptr,nullptr,false);tm->removeStagingTexture(st);
+        uint32_t id=ctx->next_tex_id++;ctx->textures[id]={tex,false,true};return id;
+    }catch(...){return 0;}
+}
+static void createGroundDetailTextures(OgreContext* ctx){
+    static const char* names[6]={"ApexSurfaceNormal_Sand","ApexSurfaceNormal_Dirt","ApexSurfaceNormal_Grass",
+        "ApexSurfaceNormal_TerrainAsphalt","ApexSurfaceNormal_Road","ApexSurfaceNormal_GrassBlade"};
+    if(!ctx)return;for(int f=1;f<=6;++f)ctx->groundNormalIds[f-1]=createProceduralSurfaceNormal(ctx,names[f-1],f);
+}
+
+// ---------------------------------------------------------------------------
+// Two tileable 2K alpha masks (cumulus + cirrus), sampled in the GPU Unlit pass.
+// Atmospheric gradients and dawn/dusk colour curves stay in the existing sky.
+// ---------------------------------------------------------------------------
+static uint32_t cloudHash2(int x,int y,int px,int py,uint32_t seed){
+    x%=px;if(x<0)x+=px;y%=py;if(y<0)y+=py;
+    uint32_t h=(uint32_t)x*0x9e3779b1u^(uint32_t)y*0x85ebca77u^seed;
+    h^=h>>16;h*=0x7feb352du;h^=h>>15;h*=0x846ca68bu;h^=h>>16;return h;
+}
+static float cloudNoisePeriodic(float u,float v,int fx,int fy,uint32_t seed){
+    float x=u*fx,y=v*fy;int ix=(int)std::floor(x),iy=(int)std::floor(y);
+    float sx=x-ix,sy=y-iy;sx=sx*sx*(3-2*sx);sy=sy*sy*(3-2*sy);
+    const float k=1.0f/16777215.0f;
+    auto h=[&](int xx,int yy){return (cloudHash2(xx,yy,fx,fy,seed)&0xffffffu)*k;};
+    return (h(ix,iy)*(1-sx)+h(ix+1,iy)*sx)*(1-sy)+(h(ix,iy+1)*(1-sx)+h(ix+1,iy+1)*sx)*sy;
+}
+static Ogre::TextureGpu* createProceduralCloudTexture(OgreContext* ctx,const char* name,bool cirrus){
+    if(!ctx||!ctx->root||!name)return nullptr;constexpr uint32_t w=2048,h=1024;
+    std::vector<uint8_t> px((size_t)w*h*4u);
+    for(uint32_t y=0;y<h;++y){float v=(float)y/h;for(uint32_t x=0;x<w;++x){float u=(float)x/w,density=0,shade=1;
+        if(!cirrus){
+            float wx=(cloudNoisePeriodic(u,v,4,2,701)-.5f)*.115f,wy=(cloudNoisePeriodic(u,v,4,2,709)-.5f)*.115f;
+            float uu=u+wx,vv=v+wy;
+            float broad=cloudNoisePeriodic(uu,vv,5,3,719),medium=cloudNoisePeriodic(uu,vv,10,6,727);
+            float detail=cloudNoisePeriodic(uu,vv,20,12,733),erosion=cloudNoisePeriodic(uu,vv,40,24,739);
+            float micro=cloudNoisePeriodic(uu,vv,80,48,743);
+            float field=broad*.48f+medium*.27f+detail*.16f+erosion*.075f+micro*.015f;
+            density=skySmoothstep(.525f,.690f,field+(erosion-.5f)*.055f+(micro-.5f)*.018f)*.92f;
+            shade=skyClamp01(.66f+medium*.22f+detail*.10f+micro*.04f);
+        }else{
+            float warp=(cloudNoisePeriodic(u,v,3,18,809)-.5f)*.075f,uu=u+warp;
+            float broad=cloudNoisePeriodic(uu,v,4,24,811),medium=cloudNoisePeriodic(uu,v,8,48,821),detail=cloudNoisePeriodic(uu,v,16,96,823);
+            density=skySmoothstep(.585f,.755f,broad*.58f+medium*.29f+detail*.13f)*.34f;
+            shade=skyClamp01(.74f+medium*.18f+detail*.08f);
+        }
+        size_t a=((size_t)y*w+x)*4u;uint8_t c=(uint8_t)(shade*255);
+        px[a]=c;px[a+1]=c;px[a+2]=c;px[a+3]=(uint8_t)(skyClamp01(density)*255);
+    }}
+    try{auto* tm=ctx->root->getRenderSystem()->getTextureGpuManager();
+        auto* tex=tm->createTexture(name,Ogre::GpuPageOutStrategy::Discard,Ogre::TextureFlags::ManualTexture,Ogre::TextureTypes::Type2D);
+        tex->setResolution(w,h);tex->setPixelFormat(Ogre::PFG_RGBA8_UNORM_SRGB);tex->scheduleTransitionTo(Ogre::GpuResidency::Resident);
+        auto* st=tm->getStagingTexture(w,h,1,1,Ogre::PFG_RGBA8_UNORM_SRGB);st->startMapRegion();
+        Ogre::TextureBox box=st->mapRegion(w,h,1,1,Ogre::PFG_RGBA8_UNORM_SRGB);
+        for(uint32_t y=0;y<h;++y)memcpy((uint8_t*)box.at(0,y,0),px.data()+(size_t)y*w*4u,(size_t)w*4u);
+        st->stopMapRegion();st->upload(box,tex,0,nullptr,nullptr,false);tm->removeStagingTexture(st);return tex;
+    }catch(...){return nullptr;}
+}
+static void createSkyCloudPass(OgreContext* ctx,Ogre::HlmsUnlit* unlit){
+    if(!ctx||!unlit||!ctx->sceneMgr||!ctx->camNode)return;
+    ctx->skyCloudTexture=createProceduralCloudTexture(ctx,"ApexSky_Cumulus_2K",false);
+    ctx->skyCirrusTexture=createProceduralCloudTexture(ctx,"ApexSky_Cirrus_2K",true);
+    Ogre::HlmsMacroblock macro;macro.mDepthCheck=false;macro.mDepthWrite=false;macro.mCullMode=Ogre::CULL_NONE;
+    Ogre::HlmsBlendblock blend;blend.setBlendType(Ogre::SBT_TRANSPARENT_ALPHA);
+    if(ctx->skyCloudTexture){
+        ctx->skyCloudDatablock=static_cast<Ogre::HlmsUnlitDatablock*>(unlit->createDatablock(
+            "ApexSkyClouds_2K","ApexSkyClouds_2K",macro,blend,Ogre::HlmsParamVec()));
+        if(ctx->skyCloudDatablock){ctx->skyCloudDatablock->setUseColour(true);ctx->skyCloudDatablock->setColour(Ogre::ColourValue(1,1,1,1));ctx->skyCloudDatablock->setTexture(0,ctx->skyCloudTexture,ctx->anisoSampler);}
+    }
+    if(ctx->skyCirrusTexture){
+        ctx->skyCirrusDatablock=static_cast<Ogre::HlmsUnlitDatablock*>(unlit->createDatablock(
+            "ApexSkyCirrus_2K","ApexSkyCirrus_2K",macro,blend,Ogre::HlmsParamVec()));
+        if(ctx->skyCirrusDatablock){ctx->skyCirrusDatablock->setUseColour(true);ctx->skyCirrusDatablock->setColour(Ogre::ColourValue(1,1,1,1));ctx->skyCirrusDatablock->setTexture(0,ctx->skyCirrusTexture,ctx->anisoSampler);}
+    }
+    if(ctx->skyCloudDatablock){
+        ctx->skyCloudManual=ctx->sceneMgr->createManualObject(Ogre::SCENE_DYNAMIC);
+        ctx->skyCloudManual->setRenderQueueGroup(kSkyCloudRenderQueueGroup);ctx->skyCloudManual->setCastShadows(false);
+        ctx->skyCloudManual->setLocalAabb(Ogre::Aabb::BOX_INFINITE);
+        ctx->skyCloudNode=ctx->camNode->createChildSceneNode(Ogre::SCENE_DYNAMIC);ctx->skyCloudNode->attachObject(ctx->skyCloudManual);
+        ctx->sceneMgr->getRenderQueue()->setSortRenderQueue(kSkyCloudRenderQueueGroup,Ogre::RenderQueue::DisableSort);
+    }
+    if(ctx->skyCirrusDatablock){
+        ctx->skyCirrusManual=ctx->sceneMgr->createManualObject(Ogre::SCENE_DYNAMIC);
+        ctx->skyCirrusManual->setRenderQueueGroup(kSkyCirrusRenderQueueGroup);ctx->skyCirrusManual->setCastShadows(false);
+        ctx->skyCirrusManual->setLocalAabb(Ogre::Aabb::BOX_INFINITE);
+        ctx->skyCirrusNode=ctx->camNode->createChildSceneNode(Ogre::SCENE_DYNAMIC);ctx->skyCirrusNode->attachObject(ctx->skyCirrusManual);
+        ctx->sceneMgr->getRenderQueue()->setSortRenderQueue(kSkyCirrusRenderQueueGroup,Ogre::RenderQueue::DisableSort);
+    }
 }
 
 static uint32_t createProceduralWaterNormal(OgreContext* ctx, const char* textureName, int variant) {
@@ -556,6 +702,7 @@ ctx->skyManual->setCastShadows(false);
 ctx->skyManual->setLocalAabb(Ogre::Aabb::BOX_INFINITE);
 ctx->skyNode = ctx->camNode->createChildSceneNode(Ogre::SCENE_DYNAMIC);
 ctx->skyNode->attachObject(ctx->skyManual);
+createSkyCloudPass(ctx, skyUnlit);
 ctx->sceneMgr->getRenderQueue()->setSortRenderQueue(kSkyRenderQueueGroup, Ogre::RenderQueue::DisableSort);
 
 // --- Official OGRE screen-space refraction workspace ---
@@ -579,6 +726,7 @@ if (compMgr->hasWorkspaceDefinition(highQualityWaterWs)) {
 }
 uint32_t white_pixel = 0xFFFFFFFF;
 ogre_create_texture(ctx, 1, 1, (const uint8_t*)&white_pixel, false);
+createGroundDetailTextures(ctx);
 createWaterPbsMaterial(ctx);
 return ctx;
 }
@@ -660,8 +808,9 @@ cm.cpu_verts.assign(verts, verts + vcount);
 cm.cpu_indices.assign(indices, indices + icount);
 if (cm.is_water) cm.animated_verts = cm.cpu_verts;
 cm.avg_spec = verts->spec;
+const bool addMeshTangents = cm.is_water || (cm.avg_spec >= 9.5f && cm.avg_spec <= 15.5f);
 for (size_t i = 0; i < cm.pool_objs.size(); ++i) {
-populateManualObject(cm.pool_objs[i], cm.pool_db_names[i], cm.cpu_verts, cm.cpu_indices, cm.is_water);
+populateManualObject(cm.pool_objs[i], cm.pool_db_names[i], cm.cpu_verts, cm.cpu_indices, addMeshTangents);
 }
 }
 
@@ -687,12 +836,9 @@ float spec, bool glass, bool water, float alpha)
 uint32_t qr = (uint32_t)(tr * 63.0f) & 63;
 uint32_t qg = (uint32_t)(tg * 63.0f) & 63;
 uint32_t qb = (uint32_t)(tb * 63.0f) & 63;
-uint32_t qs = (uint32_t)((spec + 2.0f) * 20.0f) & 255;
-uint64_t key = ((uint64_t)tex_id << 32) |
-((uint64_t)qr << 24) | ((uint64_t)qg << 18) |
-((uint64_t)qb << 12) | ((uint64_t)qs << 2)  |
-(glass ? 1ULL : 0ULL) |
-(water ? 2ULL : 0ULL);
+const uint32_t surfaceFamily = (spec >= 9.5f && spec <= 15.5f) ? static_cast<uint32_t>(std::max(1, std::min(6, static_cast<int>(std::lround(spec)) - 9))) : 0u;
+uint32_t qs = surfaceFamily ? 0u : ((uint32_t)((spec + 2.0f) * 20.0f) & 255u);
+uint64_t key = ((uint64_t)tex_id << 32) | ((uint64_t)qr << 26) | ((uint64_t)qg << 20) | ((uint64_t)qb << 14) | ((uint64_t)qs << 6) | ((uint64_t)surfaceFamily << 3) | (glass ? 2ULL : 0ULL) | (water ? 1ULL : 0ULL);
 auto it = ctx->pbs_cache.find(key);
 if (it != ctx->pbs_cache.end()) return it->second;
 auto texIt = ctx->textures.find(tex_id == 0 ? 1 : tex_id);
@@ -709,7 +855,14 @@ blend.setBlendType(Ogre::SBT_TRANSPARENT_ALPHA);
 std::string dbName = "ApexPBS_" + std::to_string(key);
 Ogre::HlmsPbsDatablock* db = (Ogre::HlmsPbsDatablock*)hlmsPbs->createDatablock(
 dbName, dbName, macro, blend, Ogre::HlmsParamVec());
-if (water && !is_cutout) {
+if (surfaceFamily > 0) {
+    db->setWorkflow(Ogre::HlmsPbsDatablock::MetallicWorkflow);db->setMetalness(0.0f);
+    float roughness=0.90f,normalWeight=0.42f,tile=220.0f;
+    switch(surfaceFamily){case 1:roughness=0.94f;normalWeight=0.52f;tile=310.0f;break;case 2:roughness=0.96f;normalWeight=0.58f;tile=245.0f;break;case 3:roughness=0.88f;normalWeight=0.32f;tile=190.0f;break;case 4:roughness=0.84f;normalWeight=0.27f;tile=420.0f;break;case 5:roughness=0.82f;normalWeight=0.30f;tile=1.0f;break;case 6:roughness=0.92f;normalWeight=0.20f;tile=1.0f;break;}
+    db->setDiffuse(Ogre::Vector3(tr,tg,tb));db->setRoughness(roughness);
+    const uint32_t normalId=ctx->groundNormalIds[surfaceFamily-1];const auto normalIt=ctx->textures.find(normalId);
+    if(normalId && normalIt!=ctx->textures.end() && normalIt->second.gpu){db->setTexture(Ogre::PBSM_DETAIL0_NM,normalIt->second.gpu,ctx->anisoSampler);db->setDetailMapWeight(0,1.0f);db->setDetailNormalWeight(0,normalWeight);db->setDetailMapOffsetScale(0,Ogre::Vector4(0.0f,0.0f,tile,tile));}
+} else if (water && !is_cutout) {
 // Water has a dark teal body, dielectric Fresnel and a sharp highlight.
 // Keep it almost opaque: the reflection/specular response, not alpha washing,
 // should provide most of its visual energy.
@@ -806,7 +959,8 @@ size_t idx = cm.used_this_frame++;
 if (idx >= cm.pool_objs.size()) {
 Ogre::ManualObject* newObj = ctx->sceneMgr->createManualObject(Ogre::SCENE_DYNAMIC);
 newObj->setRenderQueueGroup(kWorldRenderQueueGroup);
-populateManualObject(newObj, dbName, cm.cpu_verts, cm.cpu_indices, cm.is_water);
+const bool addMeshTangents = cm.is_water || (cm.avg_spec >= 9.5f && cm.avg_spec <= 15.5f);
+populateManualObject(newObj, dbName, cm.cpu_verts, cm.cpu_indices, addMeshTangents);
 Ogre::SceneNode* newNode = ctx->sceneMgr->getRootSceneNode(Ogre::SCENE_DYNAMIC)
 ->createChildSceneNode(Ogre::SCENE_DYNAMIC);
 newNode->attachObject(newObj);
@@ -1128,64 +1282,7 @@ static Ogre::Vector3 skyColourForRay(const Ogre::Vector3& rayWorld,
         colour += Ogre::Vector3(0.60f, 0.72f, 1.0f) * star * night * 0.9f;
     }
 
-    float cumulusDensity = 0.0f;
-    float cirrusDensity = 0.0f;
-    float cumulusShade = 0.50f;
-    if (ray.y > -0.005f) {
-        const float projectedY = std::fmax(ray.y, 0.035f);
-        const float lowDistance = std::fmax((1050.0f - observerWorld.y) / projectedY, 0.0f);
-        const float cloudX = observerWorld.x + ray.x * lowDistance + timeSeconds * 7.5f;
-        const float cloudZ = observerWorld.z + ray.z * lowDistance - timeSeconds * 3.2f;
-        // Smaller, warped cloud volumes with a soft multi-scale edge. Domain
-        // warping breaks the old repeated square/strip silhouettes into rounded
-        // cumulus lobes without changing the day/sunrise/sunset colour curves.
-        const float px = cloudX * 0.00162f;
-        const float pz = cloudZ * 0.00162f;
-        const float warpX = (skyNoise2(px * 0.42f + 13.1f, pz * 0.42f - 4.7f) - 0.5f) * 0.52f;
-        const float warpZ = (skyNoise2(px * 0.42f - 7.3f, pz * 0.42f + 17.9f) - 0.5f) * 0.52f;
-        const float wx = px + warpX;
-        const float wz = pz + warpZ;
-        const float broad = skyFbm2(wx * 0.96f, wz * 0.96f);
-        const float medium = skyFbm2(wx * 2.25f + 11.2f, wz * 2.25f - 6.4f);
-        const float erosion = skyNoise2(wx * 5.4f - 3.7f, wz * 5.4f + 8.1f);
-        const float billows = broad * 0.63f + medium * 0.29f + erosion * 0.08f;
-        const float shaped = billows + (erosion - 0.5f) * 0.035f;
-        cumulusDensity = skySmoothstep(0.515f, 0.675f, shaped);
-        cumulusShade = skyClamp01(0.30f + medium * 0.46f + erosion * 0.14f + sunVisible * 0.10f);
-
-        // A separate stretched high layer creates wispy cirrus streaks.
-        const float highDistance = std::fmax((2650.0f - observerWorld.y) / projectedY, 0.0f);
-        const float highX = (observerWorld.x + ray.x * highDistance) * 0.00042f + timeSeconds * 0.0018f;
-        const float highZ = (observerWorld.z + ray.z * highDistance) * 0.00165f - timeSeconds * 0.0042f;
-        const float cirrusNoise = skyFbm2(highX, highZ);
-        cirrusDensity = skySmoothstep(0.605f, 0.755f, cirrusNoise) *
-                        (0.18f + 0.20f * day + 0.10f * twilight + 0.08f * night);
-    }
-
-    if (cumulusDensity > 0.002f || cirrusDensity > 0.002f) {
-        const Ogre::Vector3 topDay(1.18f, 1.20f, 1.18f);
-        const Ogre::Vector3 bottomDay(0.40f, 0.49f, 0.62f);
-        const Ogre::Vector3 topTwilight(1.48f, 0.66f, 0.31f);
-        const Ogre::Vector3 bottomTwilight(0.17f, 0.105f, 0.20f);
-        const Ogre::Vector3 topNight(0.075f, 0.095f, 0.15f);
-        const Ogre::Vector3 bottomNight(0.012f, 0.018f, 0.038f);
-
-        Ogre::Vector3 cloudTop = skyMix(topNight, topDay, day);
-        cloudTop = skyMix(cloudTop, topTwilight, twilight);
-        Ogre::Vector3 cloudBottom = skyMix(bottomNight, bottomDay, day);
-        cloudBottom = skyMix(cloudBottom, bottomTwilight, twilight);
-        const float cloudLight = skyClamp01(cumulusShade + sunVisible * 0.10f);
-        Ogre::Vector3 cloudColour = skyMix(cloudBottom, cloudTop, cloudLight);
-        const float silverLining = std::pow(sunDot, 5.0f) *
-                                   (0.22f + 0.75f * twilight) * sunVisible;
-        cloudColour += sunTint * silverLining * 0.42f;
-
-        const float horizonFade = 0.78f + 0.22f * skySmoothstep(-0.02f, 0.16f, ray.y);
-        const float totalCloud = 1.0f - (1.0f - cumulusDensity * 0.96f) *
-                                       (1.0f - cirrusDensity);
-        colour = skyMix(colour, cloudColour,
-                        skyClamp01(totalCloud * horizonFade));
-    }
+    // High-resolution GPU cloud layers replace the old vertex-colour cloud approximation.
 
     if (night > 0.02f) {
         Ogre::Vector3 moonDir(-sun.x, std::fmax(-sun.y, 0.16f), -sun.z);
@@ -1305,6 +1402,13 @@ static void updateSkyGradient(OgreContext* ctx, float sw, float sh) {
     ctx->skyManual->setRenderQueueGroup(kSkyRenderQueueGroup);
     ctx->skyManual->setLocalAabb(Ogre::Aabb::BOX_INFINITE);
     ctx->skyManual->begin("ApexSkyGradient", Ogre::OT_TRIANGLE_LIST);
+    if(ctx->skyCloudManual){ctx->skyCloudManual->clear();ctx->skyCloudManual->setRenderQueueGroup(kSkyCloudRenderQueueGroup);ctx->skyCloudManual->setLocalAabb(Ogre::Aabb::BOX_INFINITE);ctx->skyCloudManual->begin("ApexSkyClouds_2K",Ogre::OT_TRIANGLE_LIST);}
+    if(ctx->skyCirrusManual){ctx->skyCirrusManual->clear();ctx->skyCirrusManual->setRenderQueueGroup(kSkyCirrusRenderQueueGroup);ctx->skyCirrusManual->setLocalAabb(Ogre::Aabb::BOX_INFINITE);ctx->skyCirrusManual->begin("ApexSkyCirrus_2K",Ogre::OT_TRIANGLE_LIST);}
+    const float cloudDay=skySmoothstep(-0.10f,0.25f,ctx->skySunElevation);
+    const float cloudTwilight=skySmoothstep(-0.24f,0.015f,ctx->skySunElevation)*(1.0f-skySmoothstep(0.06f,0.34f,ctx->skySunElevation));
+    const float cloudNight=1.0f-skySmoothstep(-0.16f,0.035f,ctx->skySunElevation);
+    const Ogre::Vector3 cloudTop=skyMix(skyMix(Ogre::Vector3(0.20f,0.24f,0.34f),Ogre::Vector3(1.0f,0.99f,0.96f),cloudDay),Ogre::Vector3(1.22f,0.69f,0.48f),cloudTwilight);
+    const Ogre::Vector3 cloudBottom=skyMix(skyMix(Ogre::Vector3(0.055f,0.070f,0.11f),Ogre::Vector3(0.43f,0.49f,0.58f),cloudDay),Ogre::Vector3(0.34f,0.16f,0.22f),cloudTwilight);
     for (int y = 0; y <= rows; ++y) {
         const float ny = 1.08f - 2.16f * static_cast<float>(y) / static_cast<float>(rows);
         for (int x = 0; x <= cols; ++x) {
@@ -1314,8 +1418,12 @@ static void updateSkyGradient(OgreContext* ctx, float sw, float sh) {
             const Ogre::Vector3 rayWorld = (cameraOrientation * rayLocal).normalisedCopy();
             const Ogre::Vector3 colour = skyColourForRay(
                 rayWorld, sunWorld, ctx->skySunElevation, cameraWorld, timeSeconds);
-            ctx->skyManual->position(nx * halfW, ny * halfH, -d);
-            ctx->skyManual->colour(colour.x, colour.y, colour.z, 1.0f);
+            ctx->skyManual->position(nx*halfW,ny*halfH,-d);ctx->skyManual->colour(colour.x,colour.y,colour.z,1.0f);
+            const float horizonAlpha=skySmoothstep(-0.018f,0.065f,rayWorld.y);const float lowProj=std::fmax(rayWorld.y,0.035f);
+            if(ctx->skyCloudManual){const float dist=std::fmax((1050.0f-cameraWorld.y)/lowProj,0.0f);const float wx=cameraWorld.x+rayWorld.x*dist+timeSeconds*7.5f,wz=cameraWorld.z+rayWorld.z*dist-timeSeconds*3.2f;
+                const Ogre::Vector3 tint=skyMix(cloudBottom,cloudTop,skySmoothstep(0.025f,0.34f,rayWorld.y));ctx->skyCloudManual->position(nx*halfW,ny*halfH,-d+0.0005f);ctx->skyCloudManual->textureCoord(wx*0.00162f,wz*0.00162f);ctx->skyCloudManual->colour(tint.x,tint.y,tint.z,horizonAlpha*(0.88f+0.12f*cloudDay));}
+            if(ctx->skyCirrusManual){const float dist=std::fmax((2650.0f-cameraWorld.y)/lowProj,0.0f);const float wx=cameraWorld.x+rayWorld.x*dist,wz=cameraWorld.z+rayWorld.z*dist;
+                const Ogre::Vector3 tint=skyMix(cloudBottom*0.92f,cloudTop,skySmoothstep(0.015f,0.38f,rayWorld.y));ctx->skyCirrusManual->position(nx*halfW,ny*halfH,-d+0.0003f);ctx->skyCirrusManual->textureCoord(wx*0.00042f+timeSeconds*0.0018f,wz*0.00165f-timeSeconds*0.0042f);ctx->skyCirrusManual->colour(tint.x,tint.y,tint.z,horizonAlpha*(0.20f+0.12f*cloudDay+0.05f*cloudNight));}
         }
     }
     for (int y = 0; y < rows; ++y) {
@@ -1324,11 +1432,12 @@ static void updateSkyGradient(OgreContext* ctx, float sw, float sh) {
             const uint32_t b = a + 1;
             const uint32_t c0 = a + static_cast<uint32_t>(cols + 1);
             const uint32_t d0 = c0 + 1;
-            ctx->skyManual->triangle(a, c0, b);
-            ctx->skyManual->triangle(b, c0, d0);
+            ctx->skyManual->triangle(a,c0,b);ctx->skyManual->triangle(b,c0,d0);
+            if(ctx->skyCloudManual){ctx->skyCloudManual->triangle(a,c0,b);ctx->skyCloudManual->triangle(b,c0,d0);}
+            if(ctx->skyCirrusManual){ctx->skyCirrusManual->triangle(a,c0,b);ctx->skyCirrusManual->triangle(b,c0,d0);}
         }
     }
-    ctx->skyManual->end();
+    ctx->skyManual->end();if(ctx->skyCloudManual)ctx->skyCloudManual->end();if(ctx->skyCirrusManual)ctx->skyCirrusManual->end();
     ctx->sceneMgr->getRenderQueue()->setSortRenderQueue(kSkyRenderQueueGroup, Ogre::RenderQueue::DisableSort);
 }
 
