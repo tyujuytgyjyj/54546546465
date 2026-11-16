@@ -341,8 +341,16 @@ static float surfaceNoise2(float u,float v,int fx,int fy,uint32_t seed){
 }
 static float surfaceHeight(float u,float v,int f){
     constexpr float tau=6.2831853071795864769f;float h=0;
-    if(f==1){h+=.030f*std::sin(tau*(u*18+v*3));h+=.013f*std::sin(tau*(u*37+v*7+.21f));
-        h+=.025f*(surfaceNoise2(u,v,8,4,101)-.5f)+.015f*(surfaceNoise2(u,v,16,8,103)-.5f)+.008f*(surfaceNoise2(u,v,32,16,107)-.5f)+.004f*(surfaceNoise2(u,v,64,32,109)-.5f);}
+    if(f==1){
+        // Sand: isotropic grain and shallow irregular ripples. No directional
+        // sine bands (the old waves produced ruler-straight stripes).
+        h+=.018f*(surfaceNoise2(u,v,9,9,101)-.5f);
+        h+=.013f*(surfaceNoise2(u,v,18,18,103)-.5f);
+        h+=.010f*(surfaceNoise2(u,v,36,36,107)-.5f);
+        h+=.007f*(surfaceNoise2(u,v,72,72,109)-.5f);
+        h+=.004f*(surfaceNoise2(u,v,144,144,113)-.5f);
+        h+=.002f*(surfaceNoise2(u,v,288,288,127)-.5f);
+    }
     else if(f==2){h+=.030f*(surfaceNoise2(u,v,7,7,211)-.5f)+.022f*(surfaceNoise2(u,v,14,14,223)-.5f)+.014f*(surfaceNoise2(u,v,28,28,227)-.5f)+.009f*(surfaceNoise2(u,v,56,56,229)-.5f)+.005f*(surfaceNoise2(u,v,112,112,233)-.5f);}
     else if(f==3){h+=.030f*(surfaceNoise2(u,v,5,5,307)-.5f)+.018f*(surfaceNoise2(u,v,10,10,311)-.5f)+.012f*(surfaceNoise2(u,v,20,20,313)-.5f)+.008f*(surfaceNoise2(u,v,40,40,317)-.5f)+.004f*(surfaceNoise2(u,v,80,80,331)-.5f);}
     else if(f==4){h+=.014f*(surfaceNoise2(u,v,18,18,401)-.5f)+.010f*(surfaceNoise2(u,v,36,36,409)-.5f)+.008f*(surfaceNoise2(u,v,72,72,419)-.5f)+.005f*(surfaceNoise2(u,v,144,144,421)-.5f);}
@@ -353,7 +361,7 @@ static float surfaceHeight(float u,float v,int f){
 static uint32_t createProceduralSurfaceNormal(OgreContext* ctx,const char* name,int family){
     if(!ctx||!ctx->root||!name||family<1||family>6)return 0;
     constexpr uint32_t w=512,h=512;constexpr float e=1.0f/512.0f;
-    std::vector<uint8_t> px((size_t)w*h*4u);const float strength=family==1?1.55f:(family==4?1.25f:1.40f);
+    std::vector<uint8_t> px((size_t)w*h*4u);const float strength=family==1?0.48f:(family==4?1.05f:1.25f);
     for(uint32_t y=0;y<h;++y){float v=(float)y/h;for(uint32_t x=0;x<w;++x){float u=(float)x/w;
         float dx=(surfaceHeight(u+e,v,family)-surfaceHeight(u-e,v,family))/(2*e);
         float dy=(surfaceHeight(u,v+e,family)-surfaceHeight(u,v-e,family))/(2*e);
@@ -393,28 +401,55 @@ static float cloudNoisePeriodic(float u,float v,int fx,int fy,uint32_t seed){
     return (h(ix,iy)*(1-sx)+h(ix+1,iy)*sx)*(1-sy)+(h(ix,iy+1)*(1-sx)+h(ix+1,iy+1)*sx)*sy;
 }
 static Ogre::TextureGpu* createProceduralCloudTexture(OgreContext* ctx,const char* name,bool cirrus){
-    if(!ctx||!ctx->root||!name)return nullptr;constexpr uint32_t w=2048,h=1024;
+    if(!ctx||!ctx->root||!name)return nullptr;
+    constexpr uint32_t w=2048,h=1024;
     std::vector<uint8_t> px((size_t)w*h*4u);
-    for(uint32_t y=0;y<h;++y){float v=(float)y/h;for(uint32_t x=0;x<w;++x){float u=(float)x/w,density=0,shade=1;
-        if(!cirrus){
-            float wx=(cloudNoisePeriodic(u,v,4,2,701)-.5f)*.115f,wy=(cloudNoisePeriodic(u,v,4,2,709)-.5f)*.115f;
-            float uu=u+wx,vv=v+wy;
-            float broad=cloudNoisePeriodic(uu,vv,5,3,719),medium=cloudNoisePeriodic(uu,vv,10,6,727);
-            float detail=cloudNoisePeriodic(uu,vv,20,12,733),erosion=cloudNoisePeriodic(uu,vv,40,24,739);
-            float micro=cloudNoisePeriodic(uu,vv,80,48,743);
-            float field=broad*.48f+medium*.27f+detail*.16f+erosion*.075f+micro*.015f;
-            density=skySmoothstep(.525f,.690f,field+(erosion-.5f)*.055f+(micro-.5f)*.018f)*.92f;
-            shade=skyClamp01(.66f+medium*.22f+detail*.10f+micro*.04f);
-        }else{
-            float warp=(cloudNoisePeriodic(u,v,3,18,809)-.5f)*.075f,uu=u+warp;
-            float broad=cloudNoisePeriodic(uu,v,4,24,811),medium=cloudNoisePeriodic(uu,v,8,48,821),detail=cloudNoisePeriodic(uu,v,16,96,823);
-            density=skySmoothstep(.585f,.755f,broad*.58f+medium*.29f+detail*.13f)*.34f;
-            shade=skyClamp01(.74f+medium*.18f+detail*.08f);
+    for(uint32_t y=0;y<h;++y){
+        const float v=(float)y/h;
+        for(uint32_t x=0;x<w;++x){
+            const float u=(float)x/w;
+            float density=0.0f,shade=1.0f;
+            if(!cirrus){
+                // Billowing cloud bodies: broad warped masses, cauliflower
+                // lobes, edge erosion and fine internal structure.
+                const float warpX=(cloudNoisePeriodic(u,v,3,2,701)-.5f)*.105f+
+                                  (cloudNoisePeriodic(u,v,7,4,703)-.5f)*.030f;
+                const float warpY=(cloudNoisePeriodic(u,v,3,2,709)-.5f)*.095f+
+                                  (cloudNoisePeriodic(u,v,7,4,711)-.5f)*.026f;
+                const float uu=u+warpX,vv=v+warpY;
+                const float macro=cloudNoisePeriodic(uu,vv,4,3,719);
+                const float lobe=cloudNoisePeriodic(uu,vv,9,6,727);
+                const float body=cloudNoisePeriodic(uu,vv,18,12,733);
+                const float erosion=cloudNoisePeriodic(uu,vv,38,25,739);
+                const float micro=cloudNoisePeriodic(uu,vv,78,52,743);
+                const float shape=macro*.42f+lobe*.29f+body*.17f+erosion*.085f+micro*.035f;
+                const float verticalBillow=0.035f*std::sin((v*3.14159265f)*2.0f+macro*3.0f);
+                density=skySmoothstep(.485f,.655f,shape+verticalBillow+
+                                      (erosion-.5f)*.070f+(micro-.5f)*.030f)*.96f;
+                // Fake volumetric self-shadowing: darker cloud undersides and
+                // softer, brighter sun-facing lobes, stored in RGB.
+                const float internal=macro*.30f+lobe*.30f+body*.23f+erosion*.12f+micro*.05f;
+                const float edgeLight=skySmoothstep(.48f,.78f,shape)*.12f;
+                shade=skyClamp01(.48f+internal*.43f+edgeLight);
+            }else{
+                // Thin high cirrus, stretched along a gently warped diagonal.
+                const float shear=v*1.7f+(cloudNoisePeriodic(u,v,4,22,809)-.5f)*.12f;
+                const float uu=u+shear*.18f;
+                const float broad=cloudNoisePeriodic(uu,v,4,18,811);
+                const float filaments=cloudNoisePeriodic(uu,v,10,42,821);
+                const float wisps=cloudNoisePeriodic(uu,v,22,88,823);
+                const float field=broad*.36f+filaments*.43f+wisps*.21f;
+                density=skySmoothstep(.555f,.735f,field)*.22f;
+                shade=skyClamp01(.72f+broad*.13f+filaments*.11f+wisps*.08f);
+            }
+            const size_t a=((size_t)y*w+x)*4u;
+            const uint8_t c=(uint8_t)(shade*255.0f);
+            px[a]=c;px[a+1]=c;px[a+2]=c;
+            px[a+3]=(uint8_t)(skyClamp01(density)*255.0f);
         }
-        size_t a=((size_t)y*w+x)*4u;uint8_t c=(uint8_t)(shade*255);
-        px[a]=c;px[a+1]=c;px[a+2]=c;px[a+3]=(uint8_t)(skyClamp01(density)*255);
-    }}
-    try{auto* tm=ctx->root->getRenderSystem()->getTextureGpuManager();
+    }
+    try{
+        auto* tm=ctx->root->getRenderSystem()->getTextureGpuManager();
         auto* tex=tm->createTexture(name,Ogre::GpuPageOutStrategy::Discard,Ogre::TextureFlags::ManualTexture,Ogre::TextureTypes::Type2D);
         tex->setResolution(w,h);tex->setPixelFormat(Ogre::PFG_RGBA8_UNORM_SRGB);tex->scheduleTransitionTo(Ogre::GpuResidency::Resident);
         auto* st=tm->getStagingTexture(w,h,1,1,Ogre::PFG_RGBA8_UNORM_SRGB);st->startMapRegion();
@@ -858,7 +893,7 @@ dbName, dbName, macro, blend, Ogre::HlmsParamVec());
 if (surfaceFamily > 0) {
     db->setWorkflow(Ogre::HlmsPbsDatablock::MetallicWorkflow);db->setMetalness(0.0f);
     float roughness=0.90f,normalWeight=0.42f,tile=220.0f;
-    switch(surfaceFamily){case 1:roughness=0.94f;normalWeight=0.52f;tile=310.0f;break;case 2:roughness=0.96f;normalWeight=0.58f;tile=245.0f;break;case 3:roughness=0.88f;normalWeight=0.32f;tile=190.0f;break;case 4:roughness=0.84f;normalWeight=0.27f;tile=420.0f;break;case 5:roughness=0.82f;normalWeight=0.30f;tile=1.0f;break;case 6:roughness=0.92f;normalWeight=0.20f;tile=1.0f;break;}
+    switch(surfaceFamily){case 1:roughness=0.93f;normalWeight=0.24f;tile=18.0f;break;case 2:roughness=0.96f;normalWeight=0.58f;tile=245.0f;break;case 3:roughness=0.88f;normalWeight=0.32f;tile=190.0f;break;case 4:roughness=0.84f;normalWeight=0.27f;tile=420.0f;break;case 5:roughness=0.78f;normalWeight=0.22f;tile=1.0f;break;case 6:roughness=0.92f;normalWeight=0.20f;tile=1.0f;break;}
     db->setDiffuse(Ogre::Vector3(tr,tg,tb));db->setRoughness(roughness);
     const uint32_t normalId=ctx->groundNormalIds[surfaceFamily-1];const auto normalIt=ctx->textures.find(normalId);
     if(normalId && normalIt!=ctx->textures.end() && normalIt->second.gpu){db->setTexture(Ogre::PBSM_DETAIL0_NM,normalIt->second.gpu,ctx->anisoSampler);db->setDetailMapWeight(0,1.0f);db->setDetailNormalWeight(0,normalWeight);db->setDetailMapOffsetScale(0,Ogre::Vector4(0.0f,0.0f,tile,tile));}
@@ -1419,11 +1454,23 @@ static void updateSkyGradient(OgreContext* ctx, float sw, float sh) {
             const Ogre::Vector3 colour = skyColourForRay(
                 rayWorld, sunWorld, ctx->skySunElevation, cameraWorld, timeSeconds);
             ctx->skyManual->position(nx*halfW,ny*halfH,-d);ctx->skyManual->colour(colour.x,colour.y,colour.z,1.0f);
-            const float horizonAlpha=skySmoothstep(-0.018f,0.065f,rayWorld.y);const float lowProj=std::fmax(rayWorld.y,0.035f);
-            if(ctx->skyCloudManual){const float dist=std::fmax((1050.0f-cameraWorld.y)/lowProj,0.0f);const float wx=cameraWorld.x+rayWorld.x*dist+timeSeconds*7.5f,wz=cameraWorld.z+rayWorld.z*dist-timeSeconds*3.2f;
-                const Ogre::Vector3 tint=skyMix(cloudBottom,cloudTop,skySmoothstep(0.025f,0.34f,rayWorld.y));ctx->skyCloudManual->position(nx*halfW,ny*halfH,-d+0.0005f);ctx->skyCloudManual->textureCoord(wx*0.00162f,wz*0.00162f);ctx->skyCloudManual->colour(tint.x,tint.y,tint.z,horizonAlpha*(0.88f+0.12f*cloudDay));}
-            if(ctx->skyCirrusManual){const float dist=std::fmax((2650.0f-cameraWorld.y)/lowProj,0.0f);const float wx=cameraWorld.x+rayWorld.x*dist,wz=cameraWorld.z+rayWorld.z*dist;
-                const Ogre::Vector3 tint=skyMix(cloudBottom*0.92f,cloudTop,skySmoothstep(0.015f,0.38f,rayWorld.y));ctx->skyCirrusManual->position(nx*halfW,ny*halfH,-d+0.0003f);ctx->skyCirrusManual->textureCoord(wx*0.00042f+timeSeconds*0.0018f,wz*0.00165f-timeSeconds*0.0042f);ctx->skyCirrusManual->colour(tint.x,tint.y,tint.z,horizonAlpha*(0.20f+0.12f*cloudDay+0.05f*cloudNight));}
+            const float horizonAlpha=skySmoothstep(-0.055f,0.025f,rayWorld.y);
+            // Equirectangular direction mapping keeps cloud scale stable at the
+            // horizon; the previous ground-plane projection caused radial streaks.
+            const float skyU=std::atan2(rayWorld.z,rayWorld.x)*0.1591549431f+0.5f;
+            const float skyV=std::asin(std::fmax(-1.0f,std::fmin(1.0f,rayWorld.y)))*0.3183098862f+0.5f;
+            if(ctx->skyCloudManual){
+                const Ogre::Vector3 tint=skyMix(cloudBottom,cloudTop,skySmoothstep(-0.02f,0.42f,rayWorld.y));
+                ctx->skyCloudManual->position(nx*halfW,ny*halfH,-d+0.0005f);
+                ctx->skyCloudManual->textureCoord(skyU+timeSeconds*0.000010f,skyV);
+                ctx->skyCloudManual->colour(tint.x,tint.y,tint.z,horizonAlpha*(0.94f+0.06f*cloudDay));
+            }
+            if(ctx->skyCirrusManual){
+                const Ogre::Vector3 tint=skyMix(cloudBottom*0.88f,cloudTop,skySmoothstep(-0.01f,0.48f,rayWorld.y));
+                ctx->skyCirrusManual->position(nx*halfW,ny*halfH,-d+0.0003f);
+                ctx->skyCirrusManual->textureCoord(skyU*0.72f+timeSeconds*0.000004f,skyV*1.85f);
+                ctx->skyCirrusManual->colour(tint.x,tint.y,tint.z,horizonAlpha*(0.12f+0.10f*cloudDay+0.035f*cloudNight));
+            }
         }
     }
     for (int y = 0; y < rows; ++y) {

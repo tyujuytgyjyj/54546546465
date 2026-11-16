@@ -1,23 +1,17 @@
-# APEX.drive Ground & Sky Surface Upgrade
+# APEX.drive Ground & Sky Correction
 
-## Scope
-The current upgrade targets the OGRE Next 3.0 bridge and the Rust terrain meshes.
+## Corrected from the in-game screenshots
+- Removed the fixed-altitude ground-plane projection for cloud UVs. It caused the long radial streaks and excessive repetition near the horizon.
+- Clouds now use direction-based equirectangular UVs, with separate scales and slow drift for cumulus and cirrus.
+- Reworked the 2K cumulus mask with multi-scale domain warping, rounded billow lobes, edge erosion, and baked internal light/shadow variation. Cirrus is now a thinner, less opaque filament layer.
+- Removed directional sine waves from the sand normal map. The old wave terms were the source of ruler-straight beach stripes.
+- Sand now uses isotropic multi-scale grain and a much lower normal amplitude/tile multiplier.
+- Road asphalt retains its own surface family and does not use the sand normal family.
 
-- New 2K alpha-textured cumulus and cirrus layers are drawn by OGRE Unlit on separate sky queues.
-- The established atmospheric gradient, sun, stars, moon and sunrise/sunset colour functions are kept.
-- PBS detail-normal maps are generated for sand, dirt/gravel, grass terrain, asphalt roads and grass blades.
-- Terrain albedo remains the baked 4K colour map; detail normals provide microstructure and roughness response.
-- Surface ID 4 identifies sand. It reuses dirt/gravel grip and rolling resistance, so vehicle physics values stay unchanged.
-- Water rendering is intentionally untouched; `water.rs`, the water compositor and reflection path are preserved.
+## Preserved
+- Water code and compositor are unchanged.
+- Vehicle grip, rolling resistance and suspension are unchanged.
+- Sunrise/sunset colour curves are unchanged.
 
-## Files
-- `ogre_bridge.cpp`: sky texture overlays and PBS ground surface families.
-- `level.zip`: terrain layer batching, beach classification, grass alpha texture, and sand surface mapping.
-- `tools/bake_west_coast.py`, `tools/bake_roads.py`: preserve sand as surface ID 4 when baking maps.
-
-## Install
-Replace the bridge archive and level archive, then rebuild both the C++ bridge and Rust client using the same OGRE Next 3.0 SDK/toolchain. When re-baking West Coast, use the updated scripts.
-
-The code/archive structure has been checked. No MSVC build or in-game screenshot test was available, so report any compile output before treating the upgrade as final.
-
-The cloud layers are textured GPU sky overlays, not volumetric ray-marched clouds. The ground maps add procedural PBR normal detail; authored material/albedo packs can be layered in a later pass.
+## Validation
+Source-level changes and archive structure are checked. A local Windows/MSVC OGRE build and in-game screenshot test are still required; no claim of verified runtime quality is made.
