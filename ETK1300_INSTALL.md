@@ -1,8 +1,10 @@
 # ETK 1300 856tx AWD — Installation
 
 1. Copy **etk1300_model_pack.zip** unchanged into the game's `mods` folder.
-2. Replace `main.zip`, `level.zip`, `ogre_bridge.zip` and `ogre_bridge.cpp` with the updated files from this repository.
-3. Rebuild the Rust client and the OGRE Next 3.0 bridge.
+2. Extract `ogre_bridge.zip` into `C:\\OgreSDK` so the source is exactly `C:\\OgreSDK\\ogre_bridge\\ogre_bridge.cpp`.
+3. Run `C:\\OgreSDK\\ogre_bridge\\BUILD_BRIDGE.cmd`. It rebuilds the Release DLL and import library using the configured OGRE-Next SDK.
+4. Replace `main.zip` and `level.zip` with the updated files from this repository, then rebuild the Rust client. The updated `build.rs` checks that the DLL is newer than its C++ source and copies it beside the Cargo executable; this avoids silently launching an older DLL.
+5. After launching the game, check `ogre_bridge_runtime.log` beside the loaded DLL. It records the actual DLL path, build timestamp and texture-upload results.
 4. Open the vehicle selector and choose **ETK 1300 856tx AWD**.
 
 The model pack contains `etk1300_856tx_A.glb` with 17 embedded PNG images. Twenty-five of the 66 glTF materials bind base-colour textures, including the original ETK interior, glass, gauge, engine and lighting maps; subtle bundled maps provide seat upholstery, tyre rubber and alloy-wheel finish where the source archive has no dedicated diffuse image. The GLB is a full-detail conversion of the supplied 270-node Collada source: 470,656 vertices and 158,322 triangles before runtime batching.

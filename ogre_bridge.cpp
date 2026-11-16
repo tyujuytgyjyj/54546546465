@@ -19,6 +19,7 @@
 #include <string>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <algorithm>
 
 #include "OgreAbiUtils.h"
@@ -122,6 +123,33 @@ struct OgreContext {
 };
 
 static OgreContext* g_active_ctx = nullptr;
+
+// Runtime diagnostic: this file is written beside the DLL that Windows actually
+// loaded, not beside the source tree. It proves which bridge build is active.
+static std::ofstream g_bridgeRuntimeLog;
+static uint32_t g_bridgeLoggedTextureCreates = 0;
+static void bridgeRuntimeLog(const std::string& message) {
+    if (g_bridgeRuntimeLog.is_open()) g_bridgeRuntimeLog << message << std::endl;
+}
+static void openBridgeRuntimeLog() {
+    HMODULE module = nullptr;
+    GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(&openBridgeRuntimeLog), &module);
+    char modulePath[MAX_PATH] = {};
+    const DWORD length = module ? GetModuleFileNameA(module, modulePath, MAX_PATH) : 0;
+    if (length == 0 || length >= MAX_PATH) return;
+    std::string dllPath(modulePath, length);
+    const size_t slash = dllPath.find_last_of("\\\\/");
+    const std::string directory = slash == std::string::npos ? ".\\\\" : dllPath.substr(0, slash + 1);
+    g_bridgeRuntimeLog.open(directory + "ogre_bridge_runtime.log", std::ios::out | std::ios::trunc);
+    if (g_bridgeRuntimeLog.is_open()) {
+        bridgeRuntimeLog("APEX_BRIDGE_DIAGNOSTIC=2026-11-16-r1");
+        bridgeRuntimeLog(std::string("COMPILED=") + __DATE__ + " " + __TIME__);
+        bridgeRuntimeLog(std::string("LOADED_DLL=") + dllPath);
+        bridgeRuntimeLog("TEXTURE_MIP_FIX=enabled");
+    }
+}
 
 // OGRE-Next 3.x uses numeric queue IDs.
 // Queue 200 is reserved for the native HLMS refractive-object compositor pass.
@@ -302,12 +330,22 @@ uint32_t id = ctx->next_tex_id++;
     tex->setResolution(width,height);
     tex->setPixelFormat(Ogre::PFG_RGBA8_UNORM_SRGB);
     if(rgba) {
-        if(!uploadRgbaMipChain(ctx,tex,rgba,width,height,Ogre::PFG_RGBA8_UNORM_SRGB)) return 1;
+        if(!uploadRgbaMipChain(ctx,tex,rgba,width,height,Ogre::PFG_RGBA8_UNORM_SRGB)) {
+            bridgeRuntimeLog("TEXTURE_UPLOAD_FAILED id=" + std::to_string(id) +
+                             " size=" + std::to_string(width) + "x" + std::to_string(height));
+            return 1;
+        }
     } else {
         tex->scheduleTransitionTo(Ogre::GpuResidency::Resident);
     }
 
     ctx->textures[id] = { tex, cutout, linear_filter };
+    if (g_bridgeLoggedTextureCreates < 48) {
+        bridgeRuntimeLog("TEXTURE_UPLOAD_OK id=" + std::to_string(id) +
+                         " size=" + std::to_string(width) + "x" + std::to_string(height) +
+                         " cutout=" + std::to_string(cutout ? 1 : 0));
+        ++g_bridgeLoggedTextureCreates;
+    }
     return id;
 }
 
@@ -657,6 +695,8 @@ static void updateWaterPbsAnimation(OgreContext* ctx) {
 // Init
 // ---------------------------------------------------------------------------
 BRIDGE_API void* ogre_init(const char* title, int width, int height, int msaa) {
+    openBridgeRuntimeLog();
+    bridgeRuntimeLog("OGRE_INIT_BEGIN");
     OgreContext* ctx = new OgreContext();
     g_active_ctx = ctx;
 
@@ -796,6 +836,7 @@ uint32_t white_pixel = 0xFFFFFFFF;
 ogre_create_texture(ctx, 1, 1, (const uint8_t*)&white_pixel, false);
 createGroundDetailTextures(ctx);
 createWaterPbsMaterial(ctx);
+bridgeRuntimeLog("OGRE_INIT_READY");
 return ctx;
 }
 // ---------------------------------------------------------------------------
