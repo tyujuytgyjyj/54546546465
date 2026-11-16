@@ -926,7 +926,12 @@ uint64_t key = ((uint64_t)tex_id << 32) | ((uint64_t)qr << 26) | ((uint64_t)qg <
 auto it = ctx->pbs_cache.find(key);
 if (it != ctx->pbs_cache.end()) return it->second;
 auto texIt = ctx->textures.find(tex_id == 0 ? 1 : tex_id);
-bool is_cutout=forceCutout || ((texIt!=ctx->textures.end())?texIt->second.has_cutout_alpha:false);
+// Grass blade family 15 is always alpha-cutout. Its texture deliberately
+// contains sparse curved blades on a transparent field, so a global opaque-
+ // pixel percentage test can miss it and render each blade quad as a white card.
+const bool grassBladeCutout=(spec>=14.5f && spec<=15.5f);
+bool is_cutout=forceCutout || grassBladeCutout ||
+    ((texIt!=ctx->textures.end())?texIt->second.has_cutout_alpha:false);
 Ogre::HlmsPbs* hlmsPbs =
 (Ogre::HlmsPbs*)ctx->root->getHlmsManager()->getHlms(Ogre::HLMS_PBS);
 Ogre::HlmsMacroblock macro;
