@@ -364,6 +364,7 @@ BRIDGE_API void ogre_set_texture_filter(void* raw_ctx, uint32_t tex_id, bool lin
 // ---------------------------------------------------------------------------
 static float skyClamp01(float x);
 static float skySmoothstep(float a, float b, float x);
+static Ogre::Vector3 skyMix(const Ogre::Vector3& a, const Ogre::Vector3& b, float t);
 static uint32_t surfaceHash2(int x,int y,int px,int py,uint32_t seed){
     x%=px;if(x<0)x+=px;y%=py;if(y<0)y+=py;
     uint32_t h=static_cast<uint32_t>(x)*0x8da6b343u^static_cast<uint32_t>(y)*0xd8163841u^seed;
@@ -858,7 +859,9 @@ cm.is_water = is_water;
 cm.has_explicit_cutout = false;
 cm.has_wind_vertices = false;
 for(uint32_t i=0;i<vcount;++i){
-    cm.has_explicit_cutout = cm.has_explicit_cutout || (verts[i].spec>=16.0f && verts[i].spec<18.0f);
+    cm.has_explicit_cutout = cm.has_explicit_cutout ||
+        ((verts[i].spec>=14.5f && verts[i].spec<=15.5f) ||
+         (verts[i].spec>=16.0f && verts[i].spec<18.0f));
     cm.has_wind_vertices = cm.has_wind_vertices || (verts[i].spec>=17.0f && verts[i].spec<18.0f);
 }
 if (is_water || cm.has_wind_vertices) cm.animated_verts = cm.cpu_verts;
@@ -882,7 +885,9 @@ cm.cpu_indices.assign(indices, indices + icount);
 cm.has_explicit_cutout = false;
 cm.has_wind_vertices = false;
 for(uint32_t i=0;i<vcount;++i){
-    cm.has_explicit_cutout = cm.has_explicit_cutout || (verts[i].spec>=16.0f && verts[i].spec<18.0f);
+    cm.has_explicit_cutout = cm.has_explicit_cutout ||
+        ((verts[i].spec>=14.5f && verts[i].spec<=15.5f) ||
+         (verts[i].spec>=16.0f && verts[i].spec<18.0f));
     cm.has_wind_vertices = cm.has_wind_vertices || (verts[i].spec>=17.0f && verts[i].spec<18.0f);
 }
 if (cm.is_water || cm.has_wind_vertices) cm.animated_verts = cm.cpu_verts;
@@ -992,7 +997,7 @@ if (is_cutout) {
 db->setAlphaTest(Ogre::CMPF_GREATER_EQUAL);
 db->setAlphaTestThreshold(0.32f);
 }
-if (texIt != ctx->textures.end() && tex_id > 1) {
+if (texIt != ctx->textures.end()) {
 db->setTexture(Ogre::PBSM_DIFFUSE, texIt->second.gpu,
             texIt->second.linear_filter ? ctx->anisoSampler : ctx->pointSampler);
 }
