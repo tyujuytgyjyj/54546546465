@@ -108,7 +108,7 @@ struct OgreContext {
     uint32_t waterNormalIds[3] = { 0, 0, 0 };
     bool waterRefractionEnabled = false;
 
-    uint32_t next_tex_id = 1;
+    uint32_t next_tex_id = 2; // ID 1 is reserved for Texture2D::empty() fallback
     std::unordered_map<uint32_t, TexInfo> textures;
     std::unordered_map<uint64_t, std::string> pbs_cache;
     std::unordered_map<uint32_t, Ogre::HlmsDatablock*> ui_datablocks;
@@ -997,7 +997,7 @@ if (is_cutout) {
 db->setAlphaTest(Ogre::CMPF_GREATER_EQUAL);
 db->setAlphaTestThreshold(0.32f);
 }
-if (texIt != ctx->textures.end()) {
+if (texIt != ctx->textures.end() && tex_id > 1) {
 db->setTexture(Ogre::PBSM_DIFFUSE, texIt->second.gpu,
             texIt->second.linear_filter ? ctx->anisoSampler : ctx->pointSampler);
 }
