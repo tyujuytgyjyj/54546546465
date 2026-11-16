@@ -62,6 +62,7 @@ struct CachedMesh {
     bool is_water = false;
     bool has_explicit_cutout = false;
     bool has_wind_vertices = false;
+    bool vegetation_logged = false;
     std::vector<BridgeVertex3D> animated_verts;
 
     std::vector<Ogre::ManualObject*> pool_objs;
@@ -900,10 +901,13 @@ cm.is_water = is_water;
 cm.has_explicit_cutout = false;
 cm.has_wind_vertices = false;
 for(uint32_t i=0;i<vcount;++i){
+    const float marker = verts[i].spec;
     cm.has_explicit_cutout = cm.has_explicit_cutout ||
-        ((verts[i].spec>=14.5f && verts[i].spec<=15.5f) ||
-         (verts[i].spec>=16.0f && verts[i].spec<18.0f));
-    cm.has_wind_vertices = cm.has_wind_vertices || (verts[i].spec>=17.0f && verts[i].spec<18.0f);
+        ((marker>=14.5f && marker<=15.5f) ||
+         (marker>=16.0f && marker<17.0f) ||
+         (marker>=18.0f && marker<19.0f));
+    cm.has_wind_vertices = cm.has_wind_vertices ||
+        ((marker>=17.0f && marker<18.0f) || (marker>=18.0f && marker<19.0f));
 }
 if (is_water || cm.has_wind_vertices) cm.animated_verts = cm.cpu_verts;
 cm.avg_spec = verts->spec;
@@ -926,10 +930,13 @@ cm.cpu_indices.assign(indices, indices + icount);
 cm.has_explicit_cutout = false;
 cm.has_wind_vertices = false;
 for(uint32_t i=0;i<vcount;++i){
+    const float marker = verts[i].spec;
     cm.has_explicit_cutout = cm.has_explicit_cutout ||
-        ((verts[i].spec>=14.5f && verts[i].spec<=15.5f) ||
-         (verts[i].spec>=16.0f && verts[i].spec<18.0f));
-    cm.has_wind_vertices = cm.has_wind_vertices || (verts[i].spec>=17.0f && verts[i].spec<18.0f);
+        ((marker>=14.5f && marker<=15.5f) ||
+         (marker>=16.0f && marker<17.0f) ||
+         (marker>=18.0f && marker<19.0f));
+    cm.has_wind_vertices = cm.has_wind_vertices ||
+        ((marker>=17.0f && marker<18.0f) || (marker>=18.0f && marker<19.0f));
 }
 if (cm.is_water || cm.has_wind_vertices) cm.animated_verts = cm.cpu_verts;
 cm.avg_spec = verts->spec;
@@ -973,6 +980,18 @@ auto texIt = ctx->textures.find(tex_id == 0 ? 1 : tex_id);
 const bool grassBladeCutout=(spec>=14.5f && spec<=15.5f);
 bool is_cutout=forceCutout || grassBladeCutout ||
     ((texIt!=ctx->textures.end())?texIt->second.has_cutout_alpha:false);
+if ((forceCutout || grassBladeCutout) && g_bridgeRuntimeLog.is_open()) {
+    static uint32_t loggedVegetationMaterials = 0;
+    if (loggedVegetationMaterials < 32) {
+        bridgeRuntimeLog("VEG_MATERIAL tex=" + std::to_string(tex_id) +
+            " spec=" + std::to_string(spec) +
+            " explicitCutout=" + std::to_string(forceCutout ? 1 : 0) +
+            " family=" + std::to_string(surfaceFamily) +
+            " textureReady=" + std::to_string(texIt != ctx->textures.end() && texIt->second.gpu ? 1 : 0) +
+            " alphaTest=" + std::to_string(is_cutout ? 1 : 0));
+        ++loggedVegetationMaterials;
+    }
+}
 Ogre::HlmsPbs* hlmsPbs =
 (Ogre::HlmsPbs*)ctx->root->getHlmsManager()->getHlms(Ogre::HLMS_PBS);
 Ogre::HlmsMacroblock macro;
@@ -1050,14 +1069,14 @@ db->setDiffuse(Ogre::Vector3(tr, tg, tb));
 db->setMetalness(0.04f);
 db->setRoughness(is_cutout ? 0.72f : 0.55f);
 }
-// Alpha Test للعشب وأوراق الشجر
-if (is_cutout) {
-db->setAlphaTest(Ogre::CMPF_GREATER_EQUAL);
-db->setAlphaTestThreshold(0.32f);
-}
-if (texIt != ctx->textures.end() && tex_id > 1) {
+if (texIt != ctx->textures.end() && tex_id > 1 && texIt->second.gpu) {
 db->setTexture(Ogre::PBSM_DIFFUSE, texIt->second.gpu,
             texIt->second.linear_filter ? ctx->anisoSampler : ctx->pointSampler);
+}
+// Bind the real diffuse alpha before configuring PBS alpha testing.
+if (is_cutout) {
+db->setAlphaTest(Ogre::CMPF_GREATER_EQUAL, false, true);
+db->setAlphaTestThreshold(0.32f);
 }
 ctx->pbs_cache[key] = dbName;
 return dbName;
@@ -1097,6 +1116,21 @@ if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pz) ||
     !std::isfinite(sx) || !std::isfinite(sy) || !std::isfinite(sz) ||
     std::fabs(sx) < 1.0e-6f || std::fabs(sy) < 1.0e-6f || std::fabs(sz) < 1.0e-6f) return;
 CachedMesh& cm = it->second;
+if (!cm.vegetation_logged &&
+    (cm.has_explicit_cutout || cm.has_wind_vertices || (cm.avg_spec >= 14.5f && cm.avg_spec <= 15.5f))) {
+    cm.vegetation_logged = true;
+    const auto textureIt = ctx->textures.find(cm.tex_id);
+    const bool textureReady = textureIt != ctx->textures.end() && textureIt->second.gpu != nullptr;
+    const bool textureAlphaFlag = textureIt != ctx->textures.end() && textureIt->second.has_cutout_alpha;
+    bridgeRuntimeLog("VEG_DRAW mesh=" + std::to_string(mesh_id) +
+        " tex=" + std::to_string(cm.tex_id) +
+        " spec=" + std::to_string(cm.avg_spec) +
+        " cutout=" + std::to_string(cm.has_explicit_cutout ? 1 : 0) +
+        " wind=" + std::to_string(cm.has_wind_vertices ? 1 : 0) +
+        " textureReady=" + std::to_string(textureReady ? 1 : 0) +
+        " textureAlphaFlag=" + std::to_string(textureAlphaFlag ? 1 : 0) +
+        " vertices=" + std::to_string(cm.cpu_verts.size()));
+}
 // Water has its own reflective vertex-colour pass; it must not use the generic
 // PBS alpha material that was washing out the ground under incorrect water cells.
 std::string dbName = cm.is_water
@@ -1231,8 +1265,10 @@ if (cm.is_water) {
     if(animated.size()!=cm.cpu_verts.size())animated.resize(cm.cpu_verts.size());
     for(size_t vi=0;vi<cm.cpu_verts.size();++vi){
         const BridgeVertex3D& src=cm.cpu_verts[vi];BridgeVertex3D& dst=animated[vi];dst=src;
-        if(src.spec<17.0f || src.spec>=18.0f)continue;
-        const float height=skyClamp01((src.spec-17.0f)/0.9f);
+        if(src.spec<17.0f || src.spec>=19.0f)continue;
+        // 17.x = wind only; 18.x = wind plus alpha-cutout.
+        const float markerBase = src.spec >= 18.0f ? 18.0f : 17.0f;
+        const float height=skyClamp01((src.spec-markerBase)/0.9f);
         const float phase=(src.px*windDirection.x+src.pz*windDirection.z)*0.062f+
                           windTime*1.18f+0.28f*std::sin((src.px-src.pz)*0.021f);
         const float sway=std::sin(phase)*0.18f*windGust*height*height;
