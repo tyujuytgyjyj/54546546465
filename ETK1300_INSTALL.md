@@ -1,8 +1,8 @@
 # ETK 1300 856tx AWD — Installation
 
 1. Copy **etk1300_model_pack.zip** unchanged into the game's `mods` folder.
-2. Extract `ogre_bridge.zip` into `C:\OgreSDK` so the source is exactly `C:\OgreSDK\\ogre_bridge\\ogre_bridge.cpp`.
-3. Run `C:\OgreSDK\\ogre_bridge\\BUILD_BRIDGE.cmd`. It rebuilds the Release DLL and import library using the configured OGRE-Next SDK.
+2. Extract `ogre_bridge.zip` into `C:\OgreSDK` so the source is exactly `C:\OgreSDK\ogre_bridge\ogre_bridge.cpp`.
+3. Run `C:\OgreSDK\ogre_bridge\BUILD_BRIDGE.cmd`. It rebuilds the Release DLL and import library using the configured OGRE-Next SDK.
 4. Replace `main.zip` and `level.zip` with the updated files from this repository, then rebuild the Rust client. The updated `build.rs` checks that the DLL is newer than its C++ source and copies it beside the Cargo executable; this avoids silently launching an older DLL.
 5. After launching the game, check `ogre_bridge_runtime.log` beside the loaded DLL. It records the actual DLL path, build timestamp and texture-upload results.
 6. Open the vehicle selector and choose **ETK 1300 856tx AWD**.
